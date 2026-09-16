@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Platform-Windows-0078d4.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078d4.svg" alt="Platform">
   <a href="https://pepy.tech/projects/ppt-mcp"><img src="https://static.pepy.tech/personalized-badge/ppt-mcp?period=total&units=ABBREVIATION&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="Downloads"></a>
 </p>
 
@@ -37,9 +37,13 @@ https://github.com/user-attachments/assets/178b9b5b-624d-4de0-a1dd-619dc13d4bd7
 
 ## 📋 動作環境
 
-- Windows 11
+- Windows 11、または macOS（Apple Silicon と Intel のどちらも可）
 - Microsoft PowerPoint
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
+
+macOS では COM ではなく Apple Event で PowerPoint を動かします。最初のツール
+呼び出しで OS の自動化の許可を求めるダイアログが出るので、そこで PowerPoint を
+一度許可してください。違いは [macOS 対応](#-macos-対応) にまとめてあります。
 
 ## 🚀 はじめかた
 
@@ -298,6 +302,64 @@ PowerPointのモーダルダイアログ（SmartArt レイアウト選択、保�
 
 ESCは変更を確定せずにキャンセルするため、意図しない操作は発生しません。人間が操作しない自動化ワークフローで特に有用です。
 
+## 🍎 macOS 対応
+
+**macOS で断るツールは 12 です。残りは動きます。**その 12 は
+[MACOS_PORT.md](MACOS_PORT.md) の 6.1 に名前で並べてあり、
+その一覧が古びないようにテストで見張っています。
+
+ツールも引数も返り値も Windows と同じです。違うのは PowerPoint for Mac の
+スクリプト辞書が届く範囲だけで、届かないところではツールがそう答えます。
+黙って何もしなかったことにはしません。
+
+macOS でできないこと。
+
+- **SmartArt。** 辞書にクラスもコマンドもないので、スクリプトからは作ることも
+  編集することもできません。すでに置いてあるものは、ただの図形として
+  動かしたり読んだり消したりできます
+- **フリーフォームの頂点の編集タイプ。** 角、スムーズ、対称という区別は
+  スクリプトから届く場所のどこにも記録されていません。代わりにハンドルの
+  頂点を動かしてください
+- **アニメーションを1つだけ削除。** スライドごと消すことはできます
+- **タグ、`ppt_select_shapes`、`ppt_set_table_style`、`ppt_execute_mso`。**
+  どれも辞書に届く手段がありません
+
+細かい違い。
+
+- **ツールは1つずつ順番に呼んでください。**同じ返信で並べて呼ばないでください。
+  PowerPoint に届くのは一度に1つだけなので、残りは後ろに並んで待ちます。
+  出てくる順番は届いた順のままです。待たされすぎた呼び出しは取り下げられ、
+  何も変えないままそう答えます
+- 対応するものがない引数を渡すと、その引数を名指しして断ります。
+  たとえばハイパーリンクのスクリーンチップです。外して呼び直せば通ります
+- **動画と音声はファイルを埋め込みます。リンクはできません。**再生の設定は
+  8つのうち繰り返しと再生していないときに隠すの2つだけです。隠す方は
+  アニメーションのあるスライドでは断ります。書き込むとそのスライドの
+  アニメーションを作り替えてしまうからです
+- PowerPoint はサンドボックスの中にいて任意のフォルダーに書けないので、
+  書き出しは PowerPoint 自身の容器を経由して取り出します
+- スライド画像は PNG 書き出しではなく PDF から描画しています。
+  Windows の経路より鮮明です
+- 自動化の許可はサーバーを起動したアプリに紐づきます。別のターミナルや
+  エディターから起動すると、もう一度許可を求められます
+- こまめに保存してください。損はありませんし、スクリプトの後ろで
+  サンドボックスの確認が出たときに、PowerPoint が開いている書類を全部閉じて
+  そのまま終了した例があります
+  ([#191](https://github.com/ykuwai/ppt-mcp/issues/191))
+- **グラフとフリーフォームとグループ化はクリップボード経由です。**操作の間だけ
+  クリップボードを借りて、終わったら元に戻します。辞書にこの3つを表す言葉が
+  ないので、こうして届かせています
+- **すでにあるグラフやパスを直すと、図形が作り直されます。**グラフのデータ、
+  種類、タイトル、凡例、軸、系列のツールと、頂点のツールは、図形をコピーして
+  書き換え、貼り直してから元を消します。名前、位置、重なり順は保たれますが、
+  その図形についていたアニメーションは残らず、いくつ消えたかを返り値で
+  伝えます。グラフの描画サイズに依存する引数 (`chart_style`、凡例と
+  タイトルの座標、8方向の凡例位置、`tick_label_font_size`) は引数名を挙げて
+  断ります
+- アイコンは挿入前に `sips` で PNG にしています。PowerPoint for Mac は SVG を
+  読めないからです。macOS 13 以降が必要で、それより古いと空の四角ではなく
+  理由を書いた拒否が返ります
+
 ## 📄 ライセンス
 
 MIT
@@ -306,4 +368,5 @@ MIT
 
 - [FastMCP](https://github.com/jlowin/fastmcp) — Python MCPサーバーフレームワーク
 - [pywin32](https://github.com/mhammond/pywin32) — Windows COM自動化
+- [appscript](https://github.com/hhas/appscript) — macOS Apple Event ブリッジ
 - [Model Context Protocol](https://modelcontextprotocol.io/) — by Anthropic

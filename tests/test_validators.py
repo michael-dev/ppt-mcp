@@ -957,7 +957,11 @@ class TestFontSizeWarning:
         result = font_size_warning(15.9)
         assert result is not None
         assert "15.9pt" in result
-        assert "below the recommended minimum" in result
+        # Worded as an instruction. A caller that reads this as a preference
+        # answers it by saying the size was deliberate, which is the whole
+        # reason the soft wording was dropped.
+        assert "You should" in result
+        assert "16pt" in result
 
     def test_small_size_returns_warning(self):
         result = font_size_warning(8)
@@ -2037,6 +2041,10 @@ class TestUpdateAnimationInputSequenceIndex:
 from utils.onedrive import resolve_local_path
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="OneDrive URL resolution reads the Windows registry (#185)",
+)
 class TestOneDriveResolver:
     """Tests for OneDrive URL to local path resolution."""
 
@@ -3510,6 +3518,14 @@ class TestFindReplaceTextShapeNameEmpty:
             FindReplaceTextInput(find_text="x", shape_name="")
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason=(
+        "drives a COM mock through TextRange.Replace, which only exists on "
+        "Windows. macOS has no Find and no Replace in its dictionary, so "
+        "_find_replace_text_impl walks the text in Python there instead"
+    ),
+)
 class TestFindReplaceReplaceLoopCursor:
     """Regression: Replace loop must advance the After cursor (issue #151 review).
 
@@ -3632,3 +3648,34 @@ class TestOpenPresentationInputActivate:
     def test_unknown_field_rejected(self):
         with pytest.raises(ValidationError):
             OpenPresentationInput(file_path="C:/x.pptx", activte=True)  # typo
+
+
+class TestAThemeNameWhereAHexBelongs:
+    """`Invalid hex color: #accent1` sent nobody anywhere.
+
+    The server's own instructions tell callers to use the deck's accent
+    colours rather than hardcoded RGB, and only two arguments take one by
+    name. An agent building a deck wrote the same hex twenty-five times for
+    want of knowing where the number lived.
+    """
+
+    def test_a_theme_name_is_told_where_its_hex_lives(self):
+        from utils.color import hex_to_rgb
+
+        with pytest.raises(ValueError) as caught:
+            hex_to_rgb("accent1")
+        said = str(caught.value)
+        assert "theme colour name" in said
+        assert "ppt_get_presentation_info" in said
+        assert "font_color_theme" in said
+
+    def test_a_real_hex_is_untouched(self):
+        from utils.color import hex_to_rgb
+
+        assert hex_to_rgb("#156082") == (21, 96, 130)
+
+    def test_nonsense_is_still_nonsense(self):
+        from utils.color import hex_to_rgb
+
+        with pytest.raises(ValueError, match="Invalid hex color"):
+            hex_to_rgb("nonsense")
