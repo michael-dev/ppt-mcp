@@ -751,38 +751,154 @@ def _get_all_text_impl(slide_indices) -> str:
 # ---------------------------------------------------------------------------
 # Apple Event implementation functions
 # ---------------------------------------------------------------------------
-def _set_text_impl(slide_index: int, shape_name_or_index, text: str) -> dict:
-    app = ppt._get_app_impl()
-    goto_slide(app, slide_index)
-    pres = ppt._get_pres_impl()
-    slide = pres.slides[slide_index]
-    shape = _get_shape(slide, shape_name_or_index)
+def _set_text_impl(slide_index: int, shape_name_or_index, text,
+                   start=None, length=None, search_text=None, occurrence=1,
+                   runs=None) -> dict:
+    from ppt_com.text import (
+        _check_format_spec, _for_powerpoint, _resolve_span, run_offsets,
+    )
 
-    _require_text_frame(shape)
+    shape, tr = _text_frame_of(slide_index, shape_name_or_index)
+    name = shape.name()
 
-    tr = shape.text_frame.text_range
-    text = text.replace('\n', '\r')  # \n -> paragraph break, CR here too
-    # \v (vertical tab) -> line break (Shift+Enter), passed through as it is
+    if runs is not None:
+        for spec in runs:
+            _check_format_spec(spec)
+        spans = run_offsets(runs)
+        whole = _for_powerpoint("".join(run["text"] for run in runs))
+        tr.content.set(whole)
+        if whole and not _clean(tr.content()):
+            raise RuntimeError(
+                f"PowerPoint reported no error but shape '{name}' is still "
+                "empty. The text was not written."
+            )
+        warnings, unsupported = [], []
+        for (run_start, run_length), spec in zip(spans, runs):
+            if not run_length:
+                continue
+            _, span_warnings, span_unsupported = _format_span(
+                shape, tr, whole, run_start, run_length, spec)
+            warnings += span_warnings
+            unsupported += span_unsupported
+        result = {
+            "status": "success",
+            "slide_index": slide_index,
+            "shape_name": name,
+            "text_length": tr.text_length(),
+            "paragraph_count": count(tr.paragraphs),
+            "runs": [
+                {"index": i, "text": whole[run_start - 1:run_start - 1 + run_length],
+                 "start": run_start, "length": run_length}
+                for i, (run_start, run_length) in enumerate(spans, start=1)
+            ],
+        }
+        if unsupported:
+            result["partial"] = True
+            result["unsupported"] = sorted(set(unsupported))
+        if warnings:
+            result["warnings"] = sorted(set(warnings))
+        return result
+
+    text = _for_powerpoint(text)
+
+    if start is not None or search_text is not None:
+        full_text = _text_of(tr)
+        start, length = _resolve_span(
+            full_text, name, start, length, search_text, occurrence)
+        result = {
+            "status": "success",
+            "slide_index": slide_index,
+            "shape_name": name,
+            "start": start,
+            "replaced_length": length,
+            "written_length": len(text),
+        }
+        if not _insert_or_replace(tr, full_text, start, length, text):
+            # The frame is rewritten whole, which is the one case where a
+            # span edit costs the formatting it was meant to keep.
+            rewritten = (full_text[:start - 1] + text
+                         + full_text[start - 1 + length:])
+            tr.content.set(rewritten)
+            result["warnings"] = [
+                f"Shape '{name}' refused a character range write, so its "
+                "whole text frame was rewritten and any mixed formatting "
+                "inside it is now uniform."
+            ]
+        result["text"] = _text_of(tr)
+        result["text_length"] = tr.text_length()
+        return result
+
     tr.content.set(text)
 
     # Nothing is trusted because it did not raise.
     written = _clean(tr.content())
     if text and not written:
         raise RuntimeError(
-            f"PowerPoint reported no error but shape '{shape.name()}' is still "
+            f"PowerPoint reported no error but shape '{name}' is still "
             "empty. The text was not written."
         )
 
     return {
         "status": "success",
         "slide_index": slide_index,
-        "shape_name": shape.name(),
+        "shape_name": name,
         "text_length": tr.text_length(),
         "paragraph_count": count(tr.paragraphs),
     }
 
 
-def _get_text_impl(slide_index: int, shape_name_or_index) -> dict:
+def _measure_text(shape, tr):
+    """The macOS half of ppt_com.text._measure_text.
+
+    `bounds width` and `bounds height` are on a text range here, and a line is
+    a text range, so the per line sizes come from the same property the whole
+    block uses. Each read stands on its own, so a line PowerPoint will not
+    measure costs its own two numbers and still reports its text.
+    """
+    from ppt_com.text import build_measurement
+    from ppt_mac.shapes import _text_frame_state
+
+    state = _text_frame_state(shape) or {}
+
+    lines = []
+    try:
+        line_refs = elements(tr.lines)
+    except Exception:
+        line_refs = []
+    for line in line_refs:
+        entry = {"text": None, "width_pt": None, "height_pt": None}
+        try:
+            entry["text"] = _text_of(line)
+        except Exception:
+            pass
+        try:
+            entry["width_pt"] = round(line.bounds_width(), 2)
+        except Exception:
+            pass
+        try:
+            entry["height_pt"] = round(line.bounds_height(), 2)
+        except Exception:
+            pass
+        lines.append(entry)
+
+    # An empty frame has no bounds, and asking for them is an error rather
+    # than a zero.
+    text_width = text_height = None
+    try:
+        text_width = round(tr.bounds_width(), 2)
+        text_height = round(tr.bounds_height(), 2)
+    except Exception:
+        pass
+
+    return build_measurement(
+        lines, text_width, text_height,
+        round(shape.width(), 2), round(shape.height(), 2),
+        state.get("margins"), state.get("word_wrap"), state.get("autofit"),
+        state.get("orientation"),
+    )
+
+
+def _get_text_impl(slide_index: int, shape_name_or_index, measure=False) -> dict:
     ppt._get_app_impl()
     pres = ppt._get_pres_impl()
     slide = pres.slides[slide_index]
@@ -821,6 +937,9 @@ def _get_text_impl(slide_index: int, shape_name_or_index) -> dict:
             "reported as one run using the formatting of the range as a whole."
         )
     result["runs"] = [dict(run, index=i) for i, run in enumerate(runs, start=1)]
+
+    if measure:
+        result["measurement"] = _measure_text(shape, tr)
 
     return result
 
@@ -864,60 +983,37 @@ def _format_text_impl(slide_index, shape_name_or_index,
     return result
 
 
-def _format_text_range_impl(slide_index, shape_name_or_index, start, length,
-                            search_text, occurrence,
-                            font_name, font_name_fareast, font_size, bold, italic, underline,
-                            color, font_color_theme, highlight_color) -> dict:
+def _text_frame_of(slide_index, shape_name_or_index):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
     slide = pres.slides[slide_index]
     shape = _get_shape(slide, shape_name_or_index)
-
     _require_text_frame(shape)
+    return shape, shape.text_frame.text_range
 
-    tr = shape.text_frame.text_range
-    full_text = _text_of(tr)
 
-    # Resolve search_text to start/length if provided
-    if search_text is not None:
-        pos = -1
-        search_from = 0
-        for i in range(occurrence):
-            pos = full_text.find(search_text, search_from)
-            if pos == -1:
-                if i == 0:
-                    raise ValueError(
-                        f"search_text '{search_text}' not found in shape '{shape.name()}'"
-                    )
-                else:
-                    raise ValueError(
-                        f"search_text '{search_text}' has only {i} occurrence(s) "
-                        f"in shape '{shape.name()}', but occurrence={occurrence} was requested"
-                    )
-            search_from = pos + len(search_text)
-        # Character positions are 1-based here too
-        start = pos + 1
-        length = len(search_text)
-
+def _format_span(shape, tr, full_text, start, length, spec) -> tuple:
+    """Apply one span's formatting. Returns (entry, warnings, unsupported)."""
     warnings = _apply_font_to_range(tr, start, length, {
-        "font_name": font_name,
-        "font_name_fareast": font_name_fareast,
-        "font_size": font_size,
-        "bold": bold,
-        "italic": italic,
-        "underline": underline,
-        "color": color,
-        "font_color_theme": font_color_theme,
+        "font_name": spec.get("font_name"),
+        "font_name_fareast": spec.get("font_name_fareast"),
+        "font_size": spec.get("font_size"),
+        "bold": spec.get("bold"),
+        "italic": spec.get("italic"),
+        "underline": spec.get("underline"),
+        "color": spec.get("color"),
+        "font_color_theme": spec.get("font_color_theme"),
     })
 
-    warning = None
-    if highlight_color is not None:
-        warning = _apply_highlight(tr, highlight_color, start, length)
+    unsupported = []
+    if spec.get("highlight_color") is not None:
+        warning = _apply_highlight(tr, spec["highlight_color"], start, length)
+        if warning:
+            unsupported.append("highlight_color=clear")
+            warnings.append(warning)
 
-    result = {
-        "status": "success",
-        "shape_name": shape.name(),
+    entry = {
         # Sliced from the text already read rather than asked for again. A
         # `thru` range answers one value per element, so reading its content
         # back would give a list of single characters instead of a string.
@@ -925,10 +1021,85 @@ def _format_text_range_impl(slide_index, shape_name_or_index, start, length,
         "start": start,
         "length": length,
     }
-    if warning:
+    return entry, warnings, unsupported
+
+
+def _format_text_ranges_impl(slide_index, shape_name_or_index, base, ranges) -> dict:
+    """The macOS half of ppt_com.text._format_text_ranges_impl.
+
+    Same order, same rule that every span is resolved before anything is
+    written. FrozenRedraw is a no-op here, the whole call being one round of
+    Apple Events rather than a visible sequence.
+    """
+    from ppt_com.text import _resolve_span
+
+    shape, tr = _text_frame_of(slide_index, shape_name_or_index)
+    name = shape.name()
+    full_text = _text_of(tr)
+
+    spans = [
+        _resolve_span(full_text, name, spec.get("start"), spec.get("length"),
+                      spec.get("search_text"), spec.get("occurrence", 1))
+        for spec in ranges
+    ]
+
+    from ppt_com.text import _check_format_spec
+
+    for spec in ([base] if base else []) + list(ranges):
+        _check_format_spec(spec)
+
+    warnings, unsupported, applied = [], [], []
+    if base:
+        _, base_warnings, base_unsupported = _format_span(
+            shape, tr, full_text, 1, len(full_text), base)
+        warnings += base_warnings
+        unsupported += base_unsupported
+
+    for (start, length), spec in zip(spans, ranges):
+        entry, span_warnings, span_unsupported = _format_span(
+            shape, tr, full_text, start, length, spec)
+        applied.append(entry)
+        warnings += span_warnings
+        unsupported += span_unsupported
+
+    result = {
+        "status": "success",
+        "shape_name": name,
+        "count": len(applied),
+        "ranges": applied,
+    }
+    if unsupported:
         result["partial"] = True
-        result["unsupported"] = ["highlight_color=clear"]
-        warnings.append(warning)
+        result["unsupported"] = sorted(set(unsupported))
+    if warnings:
+        result["warnings"] = sorted(set(warnings))
+    return result
+
+
+def _format_text_range_impl(slide_index, shape_name_or_index, start, length,
+                            search_text, occurrence,
+                            font_name, font_name_fareast, font_size, bold, italic, underline,
+                            color, font_color_theme, highlight_color) -> dict:
+    from ppt_com.text import _resolve_span
+
+    shape, tr = _text_frame_of(slide_index, shape_name_or_index)
+    full_text = _text_of(tr)
+    start, length = _resolve_span(
+        full_text, shape.name(), start, length, search_text, occurrence)
+
+    entry, warnings, unsupported = _format_span(
+        shape, tr, full_text, start, length, {
+            "font_name": font_name, "font_name_fareast": font_name_fareast,
+            "font_size": font_size, "bold": bold, "italic": italic,
+            "underline": underline, "color": color,
+            "font_color_theme": font_color_theme,
+            "highlight_color": highlight_color,
+        })
+
+    result = {"status": "success", "shape_name": shape.name(), **entry}
+    if unsupported:
+        result["partial"] = True
+        result["unsupported"] = unsupported
     if warnings:
         result["warnings"] = warnings
     return result
@@ -1172,6 +1343,36 @@ def _measured_bullet_type(bullet):
     return None
 
 
+def _insert_or_replace(text_range, full_text, start, length, new_text):
+    """Write `new_text` over a span, or insert it when the span is empty.
+
+    `thru` is inclusive at both ends, so there is no such thing as a range of
+    no characters to write into; asking for one is refused and the caller
+    falls back to rewriting the whole frame, which flattens exactly the
+    formatting an insertion is meant to keep.
+
+    So an insertion is done as a replacement of the character next to it,
+    rewritten with the new text beside it. The character in front is the one
+    used, which is what an insertion inherits on Windows too. At the very
+    front of the frame there is nothing in front, so the character after it
+    is used instead and the insertion takes that formatting.
+    """
+    if length:
+        return _replace_characters(text_range, start, length, new_text)
+
+    if not full_text:
+        text_range.content.set(new_text)
+        return True
+
+    if start > 1:
+        neighbour = full_text[start - 2]
+        return _replace_characters(
+            text_range, start - 1, 1, neighbour + new_text)
+
+    neighbour = full_text[0]
+    return _replace_characters(text_range, 1, 1, new_text + neighbour)
+
+
 def _replace_characters(text_range, start, length, new_text):
     """Overwrite one character range, keeping the formatting around it.
 
@@ -1197,6 +1398,7 @@ def _find_replace_text_impl(
     slide_indices,
     shape_name,
     context_chars,
+    include_groups,
 ) -> dict:
     from ppt_com.text import _build_context
 
@@ -1224,9 +1426,21 @@ def _find_replace_text_impl(
 
     hits = []
     warnings = []
+    groups_passed = []
     for slide_index in indices:
         slide = pres.slides[slide_index]
         for shape in shapes_of(slide):
+            # A group is walked past, not into, the way ppt_check_typography
+            # walks past one. Apple Events answer no members for a real group,
+            # so there is no way in from here. Said out loud rather than
+            # quietly skipped, because include_groups asked for the opposite.
+            if include_groups:
+                try:
+                    if shape.shape_type() == MsoShapeType[msoGroup]:
+                        groups_passed.append(shape.name())
+                        continue
+                except CommandError:
+                    pass
             if shape_name is not None and shape.name() != shape_name:
                 continue
             if not shape.has_text_frame():
@@ -1241,6 +1455,8 @@ def _find_replace_text_impl(
                     hit = {
                         "slide_index": slide_index,
                         "shape_name": shape.name(),
+                        # Every shape reached here is at the top level.
+                        "shape_path": shape.name(),
                         "start": match.start() + 1,
                         "length": len(match.group(0)),
                     }
@@ -1291,6 +1507,7 @@ def _find_replace_text_impl(
                     hit = {
                         "slide_index": slide_index,
                         "shape_name": shape.name(),
+                        "shape_path": shape.name(),
                         "start": start + 1,
                         "length": len(replace_text),
                     }
@@ -1300,6 +1517,17 @@ def _find_replace_text_impl(
                         )
                     hits.append(hit)
                     cursor = start + max(len(replace_text), 1)
+
+    if groups_passed:
+        named = ", ".join(sorted(set(groups_passed))[:5])
+        more = "" if len(set(groups_passed)) <= 5 else ", and others"
+        warnings.append(
+            f"include_groups was asked for and {len(set(groups_passed))} "
+            f"grouped shape(s) were still not looked inside ({named}{more}). "
+            "PowerPoint for Mac reports no members for a group over Apple "
+            "Events, so their text was neither searched nor replaced. Ungroup "
+            "with ppt_ungroup_shapes to include it."
+        )
 
     result = {
         "status": "success",

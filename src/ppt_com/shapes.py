@@ -6,7 +6,7 @@ and z-order management on PowerPoint slides.
 
 import json
 import logging
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
@@ -16,9 +16,10 @@ from backend import ppt
 from utils.navigation import goto_slide
 from utils.redraw import FrozenRedraw
 from utils.validation import font_size_warning
+from ppt_com.shape_lookup import resolve_shape, walk_group_children
 from ppt_com.constants import (
     SHAPE_TYPE_NAMES,
-    msoTrue, msoFalse,
+    msoTrue, msoFalse, msoTriStateMixed,
     msoGroup,
     msoTextOrientationHorizontal,
     msoBringToFront, msoSendToBack, msoBringForward, msoSendBackward,
@@ -159,6 +160,15 @@ ZORDER_CMD_MAP: dict[str, int] = {
 # ---------------------------------------------------------------------------
 # Pydantic input models
 # ---------------------------------------------------------------------------
+ZORDER_FIELD_DESCRIPTION = (
+    "Where the new shape lands in the stack. 'front' (default) is what "
+    "PowerPoint does. 'behind_text' puts it directly below the lowest shape "
+    "carrying text, which is what art under a caption wants and what 'back' "
+    "gets wrong on a deck with a full bleed background. 'back' is the very "
+    "bottom."
+)
+
+
 class AddShapeInput(BaseModel):
     """Input for adding an auto shape to a slide."""
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -261,6 +271,10 @@ class AddShapeInput(BaseModel):
         "Mutually exclusive with corner_radius. Ignored for other shape types.",
     )
 
+    zorder: Literal["front", "back", "behind_text"] = Field(
+        default="front", description=ZORDER_FIELD_DESCRIPTION
+    )
+
     @model_validator(mode="after")
     def check_corner_radius_exclusivity(self):
         """Ensure corner_radius and corner_radius_pt are mutually exclusive."""
@@ -306,6 +320,9 @@ class AddTextboxInput(BaseModel):
         default=None,
         description="Vertical text anchor: 'top', 'middle', or 'bottom'.",
     )
+    zorder: Literal["front", "back", "behind_text"] = Field(
+        default="front", description=ZORDER_FIELD_DESCRIPTION
+    )
 
 
 class AddPictureInput(BaseModel):
@@ -318,6 +335,9 @@ class AddPictureInput(BaseModel):
     top: float = Field(..., description="Top position in points")
     width: Optional[float] = Field(default=None, description="Width in points (auto-scale if not provided)")
     height: Optional[float] = Field(default=None, description="Height in points (auto-scale if not provided)")
+    zorder: Literal["front", "back", "behind_text"] = Field(
+        default="front", description=ZORDER_FIELD_DESCRIPTION
+    )
 
 
 class AddLineInput(BaseModel):
@@ -329,6 +349,9 @@ class AddLineInput(BaseModel):
     begin_y: float = Field(..., description="Start Y position in points")
     end_x: float = Field(..., description="End X position in points")
     end_y: float = Field(..., description="End Y position in points")
+    zorder: Literal["front", "back", "behind_text"] = Field(
+        default="front", description=ZORDER_FIELD_DESCRIPTION
+    )
 
 
 class ListShapesInput(BaseModel):
@@ -354,11 +377,40 @@ class UpdateShapeInput(BaseModel):
     slide_index: int = Field(..., ge=1, description="1-based slide index")
     shape_name: Optional[str] = Field(default=None, description="Shape name (preferred — indices shift when shapes are added/removed)")
     shape_index: Optional[int] = Field(default=None, ge=1, description="1-based shape index (unstable — prefer shape_name)")
+    shape_names: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Several shapes to update together, in one call. Use with the "
+            "d* offsets to shift a group of shapes by a fixed amount. If any "
+            "name does not resolve, nothing moves."
+        ),
+    )
+    all: bool = Field(
+        default=False,
+        description=(
+            "Update every shape on the slide. Pair with exclude to leave the "
+            "full bleed background where it is."
+        ),
+    )
+    exclude: Optional[list[str]] = Field(
+        default=None,
+        description="Names to leave alone. Only with all or shape_names.",
+    )
     left: Optional[float] = Field(default=None, description="New left position in points")
     top: Optional[float] = Field(default=None, description="New top position in points")
     width: Optional[float] = Field(default=None, description="New width in points")
     height: Optional[float] = Field(default=None, description="New height in points")
     rotation: Optional[float] = Field(default=None, description="Rotation in degrees (0-360)")
+    dleft: Optional[float] = Field(
+        default=None,
+        description="Move right by this many points, relative to where the shape is now. Negative moves left.",
+    )
+    dtop: Optional[float] = Field(
+        default=None,
+        description="Move down by this many points, relative to where the shape is now. Negative moves up, which is the usual one.",
+    )
+    dwidth: Optional[float] = Field(default=None, description="Widen by this many points, relative to the current width.")
+    dheight: Optional[float] = Field(default=None, description="Heighten by this many points, relative to the current height.")
     name: Optional[str] = Field(default=None, description="New name for the shape")
     adjustments: Optional[dict[int, float]] = Field(
         default=None,
@@ -382,6 +434,55 @@ class UpdateShapeInput(BaseModel):
                     )
         return self
 
+    @model_validator(mode="after")
+    def validate_selection(self):
+        chosen = [
+            name for name, value in (
+                ("shape_name", self.shape_name),
+                ("shape_index", self.shape_index),
+                ("shape_names", self.shape_names),
+                ("all", self.all or None),
+            ) if value is not None
+        ]
+        if not chosen:
+            raise ValueError(
+                "Say which shapes to update: shape_name, shape_index, "
+                "shape_names, or all=true"
+            )
+        if len(chosen) > 1:
+            raise ValueError(
+                f"Use one way of choosing shapes, not {' and '.join(chosen)}"
+            )
+        if self.shape_names is not None and not self.shape_names:
+            raise ValueError("shape_names must not be empty if provided")
+        if self.exclude is not None and not (self.all or self.shape_names):
+            raise ValueError("exclude only means something with all or shape_names")
+        return self
+
+    @model_validator(mode="after")
+    def validate_offsets(self):
+        for absolute, relative in (("left", "dleft"), ("top", "dtop"),
+                                   ("width", "dwidth"), ("height", "dheight")):
+            if getattr(self, absolute) is not None and getattr(self, relative) is not None:
+                raise ValueError(
+                    f"{absolute} and {relative} are mutually exclusive — set "
+                    "the position or the offset, not both"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_single_shape_only_fields(self):
+        # A rename would make duplicates, and adjustment handles mean
+        # different things on different shapes.
+        if self.all or self.shape_names:
+            for field in ("name", "adjustments"):
+                if getattr(self, field) is not None:
+                    raise ValueError(
+                        f"{field} applies to one shape, so it cannot be used "
+                        "with all or shape_names"
+                    )
+        return self
+
 
 class SetZOrderInput(BaseModel):
     """Input for changing shape z-order."""
@@ -392,7 +493,13 @@ class SetZOrderInput(BaseModel):
     shape_index: Optional[int] = Field(default=None, ge=1, description="1-based shape index (unstable — prefer shape_name)")
     command: str = Field(
         ...,
-        description="Z-order command: 'bring_to_front', 'send_to_back', 'bring_forward', 'send_backward'",
+        description=(
+            "Z-order command: 'bring_to_front', 'send_to_back', "
+            "'bring_forward', 'send_backward', or 'send_behind_text' "
+            "(directly below the lowest shape carrying text, which is where "
+            "art under a caption belongs; 'send_to_back' hides it under a "
+            "full bleed background)"
+        ),
     )
 
 
@@ -403,7 +510,8 @@ def _get_shape(slide, name_or_index: Union[str, int, None], shape_name: Optional
     """Find a shape on a slide by name or 1-based index.
 
     Accepts either a combined name_or_index parameter or separate
-    shape_name/shape_index from Pydantic models.
+    shape_name/shape_index from Pydantic models. The lookup itself is
+    ppt_com.shape_lookup.resolve_shape, so this reaches into groups too.
     """
     if shape_name is not None:
         identifier = shape_name
@@ -414,20 +522,7 @@ def _get_shape(slide, name_or_index: Union[str, int, None], shape_name: Optional
     else:
         raise ValueError("Either shape_name or shape_index must be provided.")
 
-    if isinstance(identifier, int):
-        if identifier < 1 or identifier > slide.Shapes.Count:
-            raise ValueError(
-                f"Shape index {identifier} is out of range. "
-                f"Slide has {slide.Shapes.Count} shapes (1-based)."
-            )
-        return slide.Shapes(identifier)
-
-    # String name lookup
-    for i in range(1, slide.Shapes.Count + 1):
-        shape = slide.Shapes(i)
-        if shape.Name == identifier:
-            return shape
-    raise ValueError(f"Shape '{identifier}' not found on this slide.")
+    return resolve_shape(slide, identifier)
 
 
 def _resolve_shape_type(shape_type: Union[int, str]) -> int:
@@ -446,12 +541,100 @@ def _resolve_shape_type(shape_type: Union[int, str]) -> int:
 # ---------------------------------------------------------------------------
 # COM implementation functions (run on COM thread via ppt.execute)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Where a new shape lands in the stack
+# ---------------------------------------------------------------------------
+ZORDER_PLACEMENTS = ("front", "back", "behind_text")
+
+# Not an MsoZOrderCmd. PowerPoint has four commands and none of them is this
+# one, so it travels as a sentinel the impl branches on.
+BEHIND_TEXT = "send_behind_text"
+
+
+def _carries_text(shape):
+    """True when this shape, or anything inside it, has text on it."""
+    try:
+        if shape.HasTextFrame and shape.TextFrame.HasText:
+            return True
+    except Exception:
+        # A group has no HasTextFrame at all, so the question moves inward.
+        pass
+    for child, _ in walk_group_children(shape):
+        try:
+            if child.HasTextFrame and child.TextFrame.HasText:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _text_positions(slide, shape):
+    positions = []
+    for i in range(1, slide.Shapes.Count + 1):
+        other = slide.Shapes(i)
+        if other.Name == shape.Name:
+            continue
+        if _carries_text(other):
+            positions.append(other.ZOrderPosition)
+    return positions
+
+
+def place_in_zorder(slide, shape, where):
+    """Put a freshly added shape where the caller asked for it.
+
+    PowerPoint adds every shape at the front, which is wrong for art that
+    belongs under a caption. `back` is not the answer either, because these
+    decks usually have a full bleed background at the bottom and sending the
+    new picture there hides it completely.
+
+    `behind_text` walks it up from the bottom until it sits directly below the
+    lowest shape carrying text. One step at a time, re-reading the positions,
+    because the arithmetic for "how many steps" is different depending on
+    where the shape started and getting it wrong is silent.
+
+    Returns a dict to merge into the tool's answer, or {} for the default.
+    """
+    if where in (None, "front"):
+        return {}
+
+    if where == "back":
+        shape.ZOrder(msoSendToBack)
+        return {"zorder": "back", "z_position": shape.ZOrderPosition}
+
+    if where != "behind_text":
+        raise ValueError(
+            f"Unknown zorder '{where}'. Use one of: "
+            f"{', '.join(ZORDER_PLACEMENTS)}"
+        )
+
+    if not _text_positions(slide, shape):
+        return {
+            "zorder": "front",
+            "z_position": shape.ZOrderPosition,
+            "note": (
+                "zorder was behind_text and nothing on this slide has text, "
+                "so the shape was left at the front rather than hidden under "
+                "the background."
+            ),
+        }
+
+    shape.ZOrder(msoSendToBack)
+    for _ in range(slide.Shapes.Count):
+        lowest = min(_text_positions(slide, shape))
+        if shape.ZOrderPosition + 1 >= lowest:
+            break
+        shape.ZOrder(msoBringForward)
+
+    return {"zorder": "behind_text", "z_position": shape.ZOrderPosition}
+
+
 def _add_shape_impl(
     slide_index, shape_type_int, left, top, width, height, text,
     font_name, font_size, bold, italic, font_color, align,
     fill_color, fill_type, fill_color2, fill_gradient_style, fill_transparency,
     line_visible, line_color, line_weight,
     corner_radius, corner_radius_pt,
+    zorder="front",
 ):
     app = ppt._get_app_impl()
     pres = ppt._get_pres_impl()
@@ -467,12 +650,21 @@ def _add_shape_impl(
         shape = slide.Shapes.AddShape(
             Type=shape_type_int, Left=left, Top=top, Width=width, Height=height,
         )
-        return _apply_shape_attrs(
+        result = _apply_shape_attrs(
             shape, text, font_name, font_size, bold, italic, font_color, align,
             fill_color, fill_type, fill_color2, fill_gradient_style, fill_transparency,
             line_visible, line_color, line_weight, corner_radius, corner_radius_pt,
             width, height,
         )
+        # Here rather than inside _apply_shape_attrs, which knows about a
+        # shape and not about the slide it sits on. shape_index was read in
+        # there, before the move, so it is corrected rather than left saying
+        # where the shape started.
+        placed = place_in_zorder(slide, shape, zorder)
+        if "z_position" in placed:
+            result["shape_index"] = placed["z_position"]
+        result.update(placed)
+        return result
 
 
 def _apply_shape_attrs(
@@ -568,7 +760,7 @@ def _apply_shape_attrs(
 def _add_textbox_impl(
     slide_index, left, top, width, height, text,
     font_name, font_size, bold, italic, font_color, align,
-    vertical_anchor,
+    vertical_anchor, zorder="front",
 ):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
@@ -621,14 +813,20 @@ def _add_textbox_impl(
             )
         textbox.TextFrame.VerticalAnchor = anchor_val
 
+    placed = place_in_zorder(slide, textbox, zorder)
     return {
         "success": True,
         "shape_name": textbox.Name,
+        # After the placement, not before: a dict literal evaluates its
+        # entries in order, so reading the position first reports where the
+        # shape used to be.
         "shape_index": textbox.ZOrderPosition,
+        **placed,
     }
 
 
-def _add_picture_impl(slide_index, file_path, left, top, width, height):
+def _add_picture_impl(slide_index, file_path, left, top, width, height,
+                      zorder="front"):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
@@ -654,16 +852,19 @@ def _add_picture_impl(slide_index, file_path, left, top, width, height):
     elif height is not None:
         pic.LockAspectRatio = msoTrue
         pic.Height = height
+    placed = place_in_zorder(slide, pic, zorder)
     return {
         "success": True,
         "shape_name": pic.Name,
         "shape_index": pic.ZOrderPosition,
         "width": round(pic.Width, 2),
         "height": round(pic.Height, 2),
+        **placed,
     }
 
 
-def _add_line_impl(slide_index, begin_x, begin_y, end_x, end_y):
+def _add_line_impl(slide_index, begin_x, begin_y, end_x, end_y,
+                   zorder="front"):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
@@ -671,10 +872,12 @@ def _add_line_impl(slide_index, begin_x, begin_y, end_x, end_y):
     line = slide.Shapes.AddLine(
         BeginX=begin_x, BeginY=begin_y, EndX=end_x, EndY=end_y,
     )
+    placed = place_in_zorder(slide, line, zorder)
     return {
         "success": True,
         "shape_name": line.Name,
         "shape_index": line.ZOrderPosition,
+        **placed,
     }
 
 
@@ -716,6 +919,82 @@ def _list_shapes_impl(slide_index):
     }
 
 
+def _text_frame_state(shape):
+    """Report the text frame settings that decide how text is drawn.
+
+    ppt_get_text answers with the size a run was set to, and when the frame is
+    allowed to shrink text to fit, that is not always the size on the slide.
+    Nothing else said the setting was on. The words are the ones
+    ppt_set_textframe accepts.
+
+    autofit is the configured mode, not a measurement. AutoSize is all COM
+    offers, and a shrink_to_fit box whose text already fits is drawn at its
+    full size. Whether the text is being shrunk right now is what
+    ppt_check_typography measures, by turning the setting off, reading the
+    natural height and putting it back.
+
+    Returns None for a shape with no text frame at all.
+    """
+    from ppt_com.text import (
+        AUTO_SIZE_NAMES, ORIENTATION_NAMES, VERTICAL_ANCHOR_NAMES,
+    )
+
+    try:
+        if not shape.HasTextFrame:
+            return None
+    except Exception:
+        return None
+
+    state = {
+        "autofit": None,
+        "word_wrap": None,
+        "vertical_anchor": None,
+        "orientation": None,
+        "margins": None,
+    }
+
+    # AutoSize lives on TextFrame2. TextFrame's own AutoSize cannot say
+    # shrink_to_fit, which is the one state worth reading.
+    try:
+        state["autofit"] = AUTO_SIZE_NAMES.get(shape.TextFrame2.AutoSize)
+    except Exception:
+        pass
+
+    try:
+        tf = shape.TextFrame
+    except Exception:
+        return state
+
+    try:
+        wrap = tf.WordWrap
+        # Mixed is what a group of paragraphs answers, and it is neither.
+        state["word_wrap"] = None if wrap == msoTriStateMixed else wrap == msoTrue
+    except Exception:
+        pass
+
+    try:
+        state["vertical_anchor"] = VERTICAL_ANCHOR_NAMES.get(tf.VerticalAnchor)
+    except Exception:
+        pass
+
+    try:
+        state["orientation"] = ORIENTATION_NAMES.get(tf.Orientation)
+    except Exception:
+        pass
+
+    try:
+        state["margins"] = {
+            "left": round(tf.MarginLeft, 2),
+            "right": round(tf.MarginRight, 2),
+            "top": round(tf.MarginTop, 2),
+            "bottom": round(tf.MarginBottom, 2),
+        }
+    except Exception:
+        pass
+
+    return state
+
+
 def _get_shape_info_impl(slide_index, shape_name, shape_index):
     app = ppt._get_app_impl()
     pres = ppt._get_pres_impl()
@@ -739,6 +1018,7 @@ def _get_shape_info_impl(slide_index, shape_name, shape_index):
         "text": None,
         "fill": None,
         "line": None,
+        "text_frame": _text_frame_state(shape),
     }
 
     # Animation check
@@ -850,13 +1130,47 @@ def _get_shape_info_impl(slide_index, shape_name, shape_index):
     return info
 
 
-def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, height, rotation, name, adjustments):
-    app = ppt._get_app_impl()
-    goto_slide(app, slide_index)
-    pres = ppt._get_pres_impl()
-    slide = pres.Slides(slide_index)
-    shape = _get_shape(slide, None, shape_name=shape_name, shape_index=shape_index)
+# ---------------------------------------------------------------------------
+# Choosing what an update applies to
+# ---------------------------------------------------------------------------
+def select_targets(available, shape_names, all_shapes, exclude):
+    """Work out which shapes an update should touch.
 
+    Pure arithmetic, apart from the slide, so the awkward part can be tested
+    without PowerPoint. `available` is the names on the slide at the top
+    level, in z order.
+
+    Returns one list, in the order the answer should come back in. An int is a
+    position in `available`, a str is a name that is not at the top level and
+    has to be resolved another way before anything is called missing, because
+    a shape inside a group answers to its own name everywhere else.
+
+    Positions rather than names, because two shapes on a slide can share a
+    name. Going back through the name would move the first of them twice and
+    leave the second where it was, while reporting both as done.
+
+    Order follows the slide for `all`, and the caller's list otherwise, so a
+    result reads in the order the caller thinks in.
+    """
+    excluded = set(exclude or ())
+    if all_shapes:
+        return [i for i, name in enumerate(available) if name not in excluded]
+
+    first_at = {}
+    for i, name in enumerate(available):
+        first_at.setdefault(name, i)
+
+    picked = []
+    for name in shape_names:
+        if name in excluded:
+            continue
+        picked.append(first_at.get(name, name))
+    return picked
+
+
+def _apply_geometry(shape, left, top, width, height, rotation,
+                    dleft, dtop, dwidth, dheight):
+    """Absolute values first, then the offsets, on one shape."""
     if left is not None:
         shape.Left = left
     if top is not None:
@@ -867,6 +1181,84 @@ def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, h
         shape.Height = height
     if rotation is not None:
         shape.Rotation = rotation
+    if dleft is not None:
+        shape.Left = shape.Left + dleft
+    if dtop is not None:
+        shape.Top = shape.Top + dtop
+    if dwidth is not None:
+        shape.Width = shape.Width + dwidth
+    if dheight is not None:
+        shape.Height = shape.Height + dheight
+
+
+def _geometry_of(shape):
+    return {
+        "shape_name": shape.Name,
+        "left": round(shape.Left, 2),
+        "top": round(shape.Top, 2),
+        "width": round(shape.Width, 2),
+        "height": round(shape.Height, 2),
+    }
+
+
+def _update_many_impl(slide_index, shape_names, all_shapes, exclude,
+                      left, top, width, height, rotation,
+                      dleft, dtop, dwidth, dheight):
+    """Move or resize a set of shapes in one call.
+
+    Nothing is written until every name has been resolved, so a typo leaves
+    the slide alone rather than half shifted. Seventeen shapes moving one at a
+    time is also seventeen repaints, hence the freeze.
+    """
+    app = ppt._get_app_impl()
+    goto_slide(app, slide_index)
+    pres = ppt._get_pres_impl()
+    slide = pres.Slides(slide_index)
+
+    shapes = [slide.Shapes(i) for i in range(1, slide.Shapes.Count + 1)]
+    order = [shape.Name for shape in shapes]
+
+    targets, missing = [], []
+    for pick in select_targets(order, shape_names, all_shapes, exclude):
+        if isinstance(pick, int):
+            targets.append(shapes[pick])
+            continue
+        # Not at the top level. It may still be a group's child, which
+        # answers to its own name, or a "Group 20/Rounded Rectangle 22" path,
+        # the way shape_name does.
+        try:
+            targets.append(resolve_shape(slide, pick))
+        except ValueError:
+            missing.append(pick)
+
+    if missing:
+        raise ValueError(
+            "Nothing was moved. Not found on slide "
+            f"{slide_index}, at the top level or inside a group: "
+            f"{', '.join(missing)}. On the slide: {', '.join(order)}"
+        )
+
+    with FrozenRedraw():
+        updated = []
+        for shape in targets:
+            _apply_geometry(shape, left, top, width, height, rotation,
+                            dleft, dtop, dwidth, dheight)
+            updated.append(_geometry_of(shape))
+
+    return {"success": True, "count": len(updated), "updated": updated}
+
+
+def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, height,
+                       rotation, name, adjustments,
+                       dleft=None, dtop=None, dwidth=None, dheight=None):
+    app = ppt._get_app_impl()
+    goto_slide(app, slide_index)
+    pres = ppt._get_pres_impl()
+    slide = pres.Slides(slide_index)
+    shape = _get_shape(slide, None, shape_name=shape_name, shape_index=shape_index)
+
+    _apply_geometry(shape, left, top, width, height, rotation,
+                    dleft, dtop, dwidth, dheight)
     if name is not None:
         shape.Name = name
 
@@ -951,6 +1343,17 @@ def _set_zorder_impl(slide_index, shape_name, shape_index, z_order_cmd):
     pres = ppt._get_pres_impl()
     slide = pres.Slides(slide_index)
     shape = _get_shape(slide, None, shape_name=shape_name, shape_index=shape_index)
+
+    # send_behind_text is not one of PowerPoint's four commands, it is a walk
+    # up from the bottom. Same helper the adding tools use.
+    if z_order_cmd == BEHIND_TEXT:
+        placed = place_in_zorder(slide, shape, "behind_text")
+        result = {"success": True, "shape_name": shape.Name,
+                  "new_z_position": shape.ZOrderPosition}
+        if "note" in placed:
+            result["note"] = placed["note"]
+        return result
+
     shape.ZOrder(z_order_cmd)
     return {"success": True, "shape_name": shape.Name, "new_z_position": shape.ZOrderPosition}
 
@@ -983,6 +1386,7 @@ def add_shape(params: AddShapeInput) -> str:
             params.fill_gradient_style, params.fill_transparency,
             params.line_visible, params.line_color, params.line_weight,
             params.corner_radius, params.corner_radius_pt,
+            params.zorder,
         )
         warn = font_size_warning(params.font_size)
         if warn:
@@ -1011,7 +1415,7 @@ def add_textbox(params: AddTextboxInput) -> str:
             params.text,
             params.font_name, params.font_size, params.bold,
             params.italic, params.font_color, params.align,
-            params.vertical_anchor,
+            params.vertical_anchor, params.zorder,
         )
         warn = font_size_warning(params.font_size)
         if warn:
@@ -1038,6 +1442,7 @@ def add_picture(params: AddPictureInput) -> str:
             _add_picture_impl,
             params.slide_index, params.file_path,
             params.left, params.top, params.width, params.height,
+            params.zorder,
         )
         return json.dumps(result)
     except Exception as e:
@@ -1060,6 +1465,7 @@ def add_line(params: AddLineInput) -> str:
             _add_line_impl,
             params.slide_index,
             params.begin_x, params.begin_y, params.end_x, params.end_y,
+            params.zorder,
         )
         return json.dumps(result)
     except Exception as e:
@@ -1095,6 +1501,15 @@ def get_shape_info(params: ShapeIdentifierInput) -> str:
     shape is a group container), has_animation (True if the shape has any
     animation in the main sequence), aspect_ratio_locked.
 
+    text_frame carries autofit, word_wrap, vertical_anchor, orientation and
+    the four margins, in the words ppt_set_textframe accepts, or null for a
+    shape with no text frame. autofit is the configured mode, so
+    "shrink_to_fit" says the text may be drawn smaller than the size
+    ppt_get_text reports, not that it is; ppt_check_typography measures which
+    one it is. The margins matter when working out whether a line fits,
+    because the usable width is the shape width less the left and right
+    margin, around 14pt on a default box.
+
     Args:
         params: Slide index and shape identifier (name or index).
 
@@ -1112,10 +1527,17 @@ def get_shape_info(params: ShapeIdentifierInput) -> str:
 
 
 def update_shape(params: UpdateShapeInput) -> str:
-    """Update properties of an existing shape.
+    """Update properties of an existing shape, or of several at once.
 
     Only updates properties that are provided (not None). Can change
     position, size, rotation, name, and shape-specific adjustment handles.
+
+    dleft, dtop, dwidth and dheight are offsets against what the shape has
+    now, so moving something up by 26pt does not need its current top read
+    first. shape_names and all pick several shapes, and exclude leaves some
+    out, so shifting a whole slide except its background is one call rather
+    than one per shape plus the arithmetic. Nothing is written until every
+    name has resolved, so a typo leaves the slide alone.
 
     Adjustment handles control shape-specific geometry — e.g., triangle apex
     position, arrow proportions, callout pointer, star depth, cross thickness.
@@ -1125,15 +1547,27 @@ def update_shape(params: UpdateShapeInput) -> str:
         params: Shape identifier and properties to update.
 
     Returns:
-        JSON with updated shape name, position/size, and adjustment values.
+        JSON with the updated shape name, position and size, and adjustment
+        values. For shape_names or all, a count and one entry per shape.
     """
     try:
-        result = ppt.execute(
-            _update_shape_impl,
-            params.slide_index, params.shape_name, params.shape_index,
-            params.left, params.top, params.width, params.height,
-            params.rotation, params.name, params.adjustments,
-        )
+        if params.all or params.shape_names:
+            result = ppt.execute(
+                _update_many_impl,
+                params.slide_index, params.shape_names, params.all,
+                params.exclude,
+                params.left, params.top, params.width, params.height,
+                params.rotation,
+                params.dleft, params.dtop, params.dwidth, params.dheight,
+            )
+        else:
+            result = ppt.execute(
+                _update_shape_impl,
+                params.slide_index, params.shape_name, params.shape_index,
+                params.left, params.top, params.width, params.height,
+                params.rotation, params.name, params.adjustments,
+                params.dleft, params.dtop, params.dwidth, params.dheight,
+            )
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": f"Failed to update shape: {str(e)}"})
@@ -1182,7 +1616,13 @@ def duplicate_shape(params: ShapeIdentifierInput) -> str:
 def set_shape_zorder(params: SetZOrderInput) -> str:
     """Change the z-order (stacking position) of a shape.
 
-    Commands: 'bring_to_front', 'send_to_back', 'bring_forward', 'send_backward'.
+    Commands: 'bring_to_front', 'send_to_back', 'bring_forward',
+    'send_backward', 'send_behind_text'.
+
+    'send_behind_text' puts the shape directly below the lowest shape carrying
+    text, which is where art under a caption belongs. It is not one of
+    PowerPoint's own commands; 'send_to_back' is usually wrong for this
+    because a deck with a full bleed background hides the shape completely.
 
     Args:
         params: Shape identifier and z-order command.
@@ -1192,15 +1632,15 @@ def set_shape_zorder(params: SetZOrderInput) -> str:
     """
     try:
         cmd = params.command.strip().lower().replace(" ", "_").replace("-", "_")
-        if cmd not in ZORDER_CMD_MAP:
+        if cmd != BEHIND_TEXT and cmd not in ZORDER_CMD_MAP:
             return json.dumps({
                 "error": f"Unknown z-order command '{params.command}'. "
-                f"Use one of: {', '.join(ZORDER_CMD_MAP.keys())}"
+                f"Use one of: {', '.join(list(ZORDER_CMD_MAP) + [BEHIND_TEXT])}"
             })
         result = ppt.execute(
             _set_zorder_impl,
             params.slide_index, params.shape_name, params.shape_index,
-            ZORDER_CMD_MAP[cmd],
+            BEHIND_TEXT if cmd == BEHIND_TEXT else ZORDER_CMD_MAP[cmd],
         )
         return json.dumps(result)
     except Exception as e:
@@ -1344,7 +1784,13 @@ def register_tools(mcp):
         """Get detailed information about a specific shape.
 
         Identify the shape by name (shape_name) or 1-based index (shape_index).
-        Returns full text, fill info, line info, rotation, and z-order.
+        Returns full text, fill info, line info, rotation, z-order, and
+        text_frame (autofit, word_wrap, vertical_anchor, orientation,
+        margins). Read text_frame before sizing text to fit a box. autofit is
+        the configured mode, so "shrink_to_fit" means the drawn size may be
+        smaller than the size that was set, and ppt_check_typography is what
+        says whether it currently is. The usable width is the shape width
+        less the side margins.
         """
         return await run_offloaded(get_shape_info, params)
 
@@ -1354,15 +1800,33 @@ def register_tools(mcp):
             "title": "Update Shape",
             "readOnlyHint": False,
             "destructiveHint": False,
-            "idempotentHint": True,
+            # The absolute fields are idempotent and the d* offsets are not:
+            # a retried dtop=-26 moves the shape another 26 points. The hint
+            # is one value for the whole tool, so it takes the honest one.
+            "idempotentHint": False,
             "openWorldHint": False,
         },
     )
     async def tool_update_shape(params: UpdateShapeInput) -> str:
-        """Update properties of an existing shape.
+        """Update properties of an existing shape, or of several at once.
 
-        Identify the shape by name or index. Only provided properties are updated.
-        Can change position (left, top), size (width, height), rotation, and name.
+        Identify the shape by name or index, or several with shape_names, or
+        every shape on the slide with all=true plus exclude for the ones to
+        leave alone. Only provided properties are updated.
+
+        Absolute: left, top, width, height, rotation, name.
+        Relative: dleft, dtop, dwidth, dheight, applied to what the shape has
+        now. Prefer these for moving things, no read and no arithmetic first.
+
+        Shifting a whole slide up by 26pt except its background is one call:
+        all=true, exclude=["Picture 2"], dtop=-26. Nothing is written until
+        every name has resolved, so a typo leaves the slide alone rather than
+        half shifted.
+
+        The d* offsets are not idempotent: sending the same call twice moves
+        the shape twice. all=true means the shapes at the top level, so a
+        group moves as one; name a group's child in shape_names to reach
+        inside it.
         """
         return await run_offloaded(update_shape, params)
 
@@ -1415,7 +1879,9 @@ def register_tools(mcp):
     async def tool_set_shape_zorder(params: SetZOrderInput) -> str:
         """Change the z-order (stacking position) of a shape.
 
-        Commands: 'bring_to_front', 'send_to_back', 'bring_forward', 'send_backward'.
+        Commands: 'bring_to_front', 'send_to_back', 'bring_forward',
+        'send_backward', 'send_behind_text' (directly below the lowest shape
+        that has text, for art that belongs under a caption).
         Identify the shape by name (shape_name) or 1-based index (shape_index).
         """
         return await run_offloaded(set_shape_zorder, params)

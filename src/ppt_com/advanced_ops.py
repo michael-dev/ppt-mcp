@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
@@ -33,6 +33,9 @@ from ppt_com.constants import (
     PICTURE_COLOR_TYPE_MAP, PICTURE_COLOR_TYPE_NAMES,
 )
 from ppt_com.shapes import SHAPE_NAME_MAP
+from ppt_com.shape_lookup import resolve_shape as _get_shape
+
+from ppt_com.shapes import ZORDER_FIELD_DESCRIPTION, place_in_zorder
 
 logger = logging.getLogger(__name__)
 
@@ -209,36 +212,6 @@ def _drop_what_cannot_be_inserted(results, max_results):
                 if available:
                     kept.append(icon)
     return kept[:max_results]
-
-
-# ---------------------------------------------------------------------------
-# Helper: find a shape by name or index
-# ---------------------------------------------------------------------------
-def _get_shape(slide, name_or_index: Union[str, int]):
-    """Find a shape on a slide by name or 1-based index.
-
-    Args:
-        slide: Slide COM object
-        name_or_index: Shape name (str) or 1-based index (int)
-
-    Returns:
-        Shape COM object
-
-    Raises:
-        ValueError: If shape not found
-    """
-    if isinstance(name_or_index, int):
-        if name_or_index < 1 or name_or_index > slide.Shapes.Count:
-            raise ValueError(
-                f"Shape index {name_or_index} out of range "
-                f"(1-{slide.Shapes.Count})"
-            )
-        return slide.Shapes(name_or_index)
-    else:
-        for i in range(1, slide.Shapes.Count + 1):
-            if slide.Shapes(i).Name == name_or_index:
-                return slide.Shapes(i)
-        raise ValueError(f"Shape '{name_or_index}' not found on slide")
 
 
 # ===========================================================================
@@ -529,6 +502,9 @@ class AddPictureFromUrlInput(BaseModel):
             "aspect ratio and centering. Requires both width and height."
         ),
     )
+    zorder: Literal["front", "back", "behind_text"] = Field(
+        default="front", description=ZORDER_FIELD_DESCRIPTION
+    )
 
 
 # --- Add SVG Icon ---
@@ -564,6 +540,9 @@ class AddSvgIconInput(BaseModel):
     filled: bool = Field(
         default=False,
         description="If true, use the filled variant of the icon instead of outline.",
+    )
+    zorder: Literal["front", "back", "behind_text"] = Field(
+        default="front", description=ZORDER_FIELD_DESCRIPTION
     )
 
 
@@ -1105,7 +1084,8 @@ def _copy_animation_impl(slide_index, source_shape, target_shape):
 # ---------------------------------------------------------------------------
 # Add Picture from URL
 # ---------------------------------------------------------------------------
-def _add_picture_from_url_impl(slide_index, url, left, top, width, height, svg_color, fit):
+def _add_picture_from_url_impl(slide_index, url, left, top, width, height, svg_color, fit,
+                               zorder="front"):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
@@ -1151,6 +1131,7 @@ def _add_picture_from_url_impl(slide_index, url, left, top, width, height, svg_c
             h = height if height is not None else -1
             pic = slide.Shapes.AddPicture(abs_tmp, 0, -1, left, top, w, h)
 
+        placed = place_in_zorder(slide, pic, zorder)
         return {
             "success": True,
             "shape_name": pic.Name,
@@ -1158,6 +1139,7 @@ def _add_picture_from_url_impl(slide_index, url, left, top, width, height, svg_c
             "width": round(pic.Width, 2),
             "height": round(pic.Height, 2),
             "source_url": url,
+            **placed,
         }
     finally:
         if os.path.exists(tmp_path):
@@ -1344,7 +1326,8 @@ def _set_default_shape_style_impl(
     return json.dumps({"success": True})
 
 
-def _add_svg_icon_impl(slide_index, icon_name, left, top, width, height, color, style, filled):
+def _add_svg_icon_impl(slide_index, icon_name, left, top, width, height, color, style, filled,
+                       zorder="front"):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
@@ -1399,6 +1382,7 @@ def _add_svg_icon_impl(slide_index, icon_name, left, top, width, height, color, 
         pic.Left = left + (width - new_w) / 2
         pic.Top = top + (height - new_h) / 2
 
+        placed = place_in_zorder(slide, pic, zorder)
         return {
             "success": True,
             "shape_name": pic.Name,
@@ -1406,6 +1390,7 @@ def _add_svg_icon_impl(slide_index, icon_name, left, top, width, height, color, 
             "width": round(pic.Width, 2),
             "height": round(pic.Height, 2),
             "icon_name": icon_name,
+            **placed,
             "source_url": svg_url,
         }
     finally:
@@ -1768,7 +1753,7 @@ def add_picture_from_url(params: AddPictureFromUrlInput) -> str:
             _add_picture_from_url_impl,
             params.slide_index, params.url,
             params.left, params.top, params.width, params.height,
-            params.svg_color, params.fit,
+            params.svg_color, params.fit, params.zorder,
         )
         return json.dumps(result)
     except Exception as e:
@@ -1790,7 +1775,7 @@ def add_svg_icon(params: AddSvgIconInput) -> str:
             _add_svg_icon_impl,
             params.slide_index, params.icon_name,
             params.left, params.top, params.width, params.height,
-            params.color, params.style, params.filled,
+            params.color, params.style, params.filled, params.zorder,
         )
         return json.dumps(result)
     except Exception as e:

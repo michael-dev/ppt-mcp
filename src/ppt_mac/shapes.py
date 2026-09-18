@@ -33,6 +33,7 @@ from backend.mac_ae import (
     osascript,
     ppt,
     raw,
+    shapes_of,
     slide_at as _slide,
     stage_into_container,
 )
@@ -42,12 +43,16 @@ from backend.mac_enums import (
     MsoGradientStyle,
     MsoLineDashStyle,
     MsoShapeType,
+    MsoTextOrientation,
     MsoVerticalAnchor,
     MsoZOrderCmd,
     PpParagraphAlignment,
     to_keyword,
 )
-from ppt_com.constants import GRADIENT_STYLE_MAP, SHAPE_TYPE_NAMES, msoGroup
+from ppt_com.constants import (
+    GRADIENT_STYLE_MAP, SHAPE_TYPE_NAMES,
+    msoBringForward, msoGroup, msoSendToBack,
+)
 from utils.color import hex_to_rgb_list, rgb_list_to_hex
 from utils.navigation import goto_slide
 from utils.redraw import FrozenRedraw
@@ -61,6 +66,10 @@ _WIN_SHAPE_TYPE = {word: number for number, word in MsoShapeType.items()}
 _WIN_AUTO_SHAPE_TYPE = {word: number for number, word in MsoAutoShapeType.items()}
 _WIN_FILL_TYPE = {word: number for number, word in MsoFillType.items()}
 _WIN_DASH_STYLE = {word: number for number, word in MsoLineDashStyle.items()}
+_WIN_VERTICAL_ANCHOR = {word: number for number, word in MsoVerticalAnchor.items()}
+_WIN_TEXT_ORIENTATION = {
+    word: number for number, word in MsoTextOrientation.items()
+}
 
 # The four character codes for the two properties appscript cannot reach by
 # name. Both names are taken by AppleScript's own built-in vocabulary, which
@@ -386,12 +395,112 @@ def _resolve_image_path(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Apple Event implementation functions (run on the worker thread via ppt.execute)
 # ---------------------------------------------------------------------------
+def _carries_text(shape):
+    """True when this shape has text on it.
+
+    Windows also looks inside a group, because a caption in one is still text
+    to sit under. Here a group answers no members over Apple Events, so a
+    group is judged by its own (absent) text frame and a caption inside one is
+    not seen. Same gap ppt_check_typography reports.
+    """
+    try:
+        return bool(shape.has_text_frame() and shape.text_frame.has_text())
+    except Exception:
+        return False
+
+
+def _text_positions(slide, shape, own_name):
+    positions = []
+    for other in shapes_of(slide):
+        try:
+            if other.name() == own_name:
+                continue
+        except Exception:
+            continue
+        if _carries_text(other):
+            try:
+                positions.append(other.z_order_position())
+            except Exception:
+                continue
+    return positions
+
+
+def _refind(slide, name):
+    """The shape called `name`, addressed afresh.
+
+    Every reference here is `slide.shapes[i]`, resolved at each use, so the
+    moment the z order changes the reference names whatever shape inherited
+    that index. A reference held across a `z order` call reads and moves the
+    wrong shape. Names survive the reordering, so they are what the walk holds
+    on to.
+    """
+    for shape in shapes_of(slide):
+        try:
+            if shape.name() == name:
+                return shape
+        except CommandError:
+            continue
+    raise ValueError(f"Shape '{name}' not found on slide")
+
+
+def place_in_zorder(slide, shape, where):
+    """The macOS half of ppt_com.shapes.place_in_zorder. Same words, same walk.
+
+    The shape is re-found by name after every move, for the reason in _refind.
+    The caller's own reference is stale once this returns, so it should read
+    what it needs before calling and take the final position from the answer.
+    """
+    if where in (None, "front"):
+        return {}
+
+    send_to_back = to_keyword(MsoZOrderCmd, msoSendToBack, "z order command")
+    bring_forward = to_keyword(MsoZOrderCmd, msoBringForward, "z order command")
+    own_name = shape.name()
+
+    if where == "back":
+        shape.z_order(z_order_position=send_to_back)
+        return {
+            "zorder": "back",
+            "z_position": _refind(slide, own_name).z_order_position(),
+        }
+
+    if where != "behind_text":
+        raise ValueError(
+            f"Unknown zorder '{where}'. Use one of: front, back, behind_text"
+        )
+
+    if not _text_positions(slide, shape, own_name):
+        return {
+            "zorder": "front",
+            "z_position": shape.z_order_position(),
+            "note": (
+                "zorder was behind_text and nothing on this slide has text, "
+                "so the shape was left at the front rather than hidden under "
+                "the background."
+            ),
+        }
+
+    shape.z_order(z_order_position=send_to_back)
+    for _ in range(count(slide.shapes)):
+        shape = _refind(slide, own_name)
+        lowest = min(_text_positions(slide, shape, own_name))
+        if shape.z_order_position() + 1 >= lowest:
+            break
+        shape.z_order(z_order_position=bring_forward)
+
+    return {
+        "zorder": "behind_text",
+        "z_position": _refind(slide, own_name).z_order_position(),
+    }
+
+
 def _add_shape_impl(
     slide_index, shape_type_int, left, top, width, height, text,
     font_name, font_size, bold, italic, font_color, align,
     fill_color, fill_type, fill_color2, fill_gradient_style, fill_transparency,
     line_visible, line_color, line_weight,
     corner_radius, corner_radius_pt,
+    zorder="front",
 ):
     # Both names are checked here rather than where they are used, so a
     # misspelling costs nothing. Checked later, it left a styled shape on the
@@ -423,12 +532,19 @@ def _add_shape_impl(
             },
         )
         _verify_created(shape, width, height)
-        return _apply_shape_attrs(
+        result = _apply_shape_attrs(
             shape, text, font_name, font_size, bold, italic, font_color, align,
             fill_color, fill_type, fill_color2, fill_gradient_style, fill_transparency,
             line_visible, line_color, line_weight, corner_radius, corner_radius_pt,
             width, height,
         )
+        # Here rather than inside _apply_shape_attrs, which knows about a
+        # shape and not about the slide it sits on.
+        placed = place_in_zorder(slide, shape, zorder)
+        if "z_position" in placed:
+            result["shape_index"] = placed["z_position"]
+        result.update(placed)
+        return result
 
 
 def _apply_shape_attrs(
@@ -569,7 +685,7 @@ def _apply_line_visibility(line, visible: bool):
 def _add_textbox_impl(
     slide_index, left, top, width, height, text,
     font_name, font_size, bold, italic, font_color, align,
-    vertical_anchor,
+    vertical_anchor, zorder="front",
 ):
     # Before the first Apple Event, so a misspelled name costs neither a stray
     # text box on the slide nor a jump to a slide the caller was not looking at.
@@ -626,14 +742,20 @@ def _add_textbox_impl(
             )
         )
 
+    # Read before the move: place_in_zorder leaves the caller's reference
+    # pointing at whatever shape inherited its index.
+    name = textbox.name()
+    placed = place_in_zorder(slide, textbox, zorder)
     return {
         "success": True,
-        "shape_name": textbox.name(),
-        "shape_index": textbox.z_order_position(),
+        "shape_name": name,
+        "shape_index": placed.get("z_position", textbox.z_order_position()),
+        **placed,
     }
 
 
-def _add_picture_impl(slide_index, file_path, left, top, width, height):
+def _add_picture_impl(slide_index, file_path, left, top, width, height,
+                      zorder="front"):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
@@ -679,16 +801,21 @@ def _add_picture_impl(slide_index, file_path, left, top, width, height):
     elif height is not None:
         pic.lock_aspect_ratio.set(True)
         pic.height.set(height)
+    name = pic.name()
+    size = (round(pic.width(), 2), round(pic.height(), 2))
+    placed = place_in_zorder(slide, pic, zorder)
     return {
         "success": True,
-        "shape_name": pic.name(),
-        "shape_index": pic.z_order_position(),
-        "width": round(pic.width(), 2),
-        "height": round(pic.height(), 2),
+        "shape_name": name,
+        "shape_index": placed.get("z_position", pic.z_order_position()),
+        "width": size[0],
+        "height": size[1],
+        **placed,
     }
 
 
-def _add_line_impl(slide_index, begin_x, begin_y, end_x, end_y):
+def _add_line_impl(slide_index, begin_x, begin_y, end_x, end_y,
+                   zorder="front"):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
@@ -706,10 +833,13 @@ def _add_line_impl(slide_index, begin_x, begin_y, end_x, end_y):
     _verify_created(
         line, None, None, expected_type=k.shape_type_line, what="line"
     )
+    name = line.name()
+    placed = place_in_zorder(slide, line, zorder)
     return {
         "success": True,
-        "shape_name": line.name(),
-        "shape_index": line.z_order_position(),
+        "shape_name": name,
+        "shape_index": placed.get("z_position", line.z_order_position()),
+        **placed,
     }
 
 
@@ -775,6 +905,86 @@ def _list_shapes_impl(slide_index):
     }
 
 
+def _text_frame_state(shape):
+    """The macOS half of ppt_com.shapes._text_frame_state.
+
+    `auto size` sits on the text frame here rather than needing a TextFrame2
+    detour, and it does carry shrink to fit, so the one setting worth reading
+    is readable. The words are the same as on Windows, and so is the caveat
+    that autofit is the configured mode rather than a measurement.
+    """
+    from ppt_com.text import (
+        AUTO_SIZE_NAMES, ORIENTATION_NAMES, VERTICAL_ANCHOR_NAMES,
+    )
+    from ppt_mac.text import _AUTO_SIZE
+
+    win_auto_size = {word: number for number, word in _AUTO_SIZE.items()}
+
+    try:
+        if not shape.has_text_frame():
+            return None
+    except Exception:
+        return None
+
+    state = {
+        "autofit": None,
+        "word_wrap": None,
+        "vertical_anchor": None,
+        "orientation": None,
+        "margins": None,
+    }
+
+    try:
+        tf = shape.text_frame
+    except Exception:
+        return state
+
+    try:
+        state["autofit"] = AUTO_SIZE_NAMES.get(
+            _win_constant(win_auto_size, tf.auto_size())
+        )
+    except Exception:
+        pass
+
+    try:
+        wrap = tf.word_wrap()
+        state["word_wrap"] = None if is_missing(wrap) else bool(wrap)
+    except Exception:
+        pass
+
+    try:
+        state["vertical_anchor"] = VERTICAL_ANCHOR_NAMES.get(
+            _win_constant(_WIN_VERTICAL_ANCHOR, tf.vertical_anchor())
+        )
+    except Exception:
+        pass
+
+    try:
+        # `text orientation` rather than `orientation`, so what is read back is
+        # the property ppt_set_textframe writes.
+        state["orientation"] = ORIENTATION_NAMES.get(
+            _win_constant(_WIN_TEXT_ORIENTATION, tf.text_orientation())
+        )
+    except Exception:
+        pass
+
+    try:
+        margins = {
+            "left": tf.margin_left(),
+            "right": tf.margin_right(),
+            "top": tf.margin_top(),
+            "bottom": tf.margin_bottom(),
+        }
+        if not any(is_missing(value) for value in margins.values()):
+            state["margins"] = {
+                side: round(value, 2) for side, value in margins.items()
+            }
+    except Exception:
+        pass
+
+    return state
+
+
 def _get_shape_info_impl(slide_index, shape_name, shape_index):
     ppt._get_app_impl()
     pres = ppt._get_pres_impl()
@@ -813,6 +1023,7 @@ def _get_shape_info_impl(slide_index, shape_name, shape_index):
         "text": None,
         "fill": None,
         "line": None,
+        "text_frame": _text_frame_state(shape),
     }
 
     # Animation check, through the per shape settings rather than the slide's
@@ -939,13 +1150,9 @@ def _get_shape_info_impl(slide_index, shape_name, shape_index):
     return info
 
 
-def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, height, rotation, name, adjustments):
-    app = ppt._get_app_impl()
-    goto_slide(app, slide_index)
-    pres = ppt._get_pres_impl()
-    slide = _slide(pres, slide_index)
-    shape = _get_shape(slide, None, shape_name=shape_name, shape_index=shape_index)
-
+def _apply_geometry(shape, left, top, width, height, rotation,
+                    dleft, dtop, dwidth, dheight):
+    """Absolute values first, then the offsets, on one shape."""
     if left is not None:
         shape.left_position.set(left)
     if top is not None:
@@ -956,6 +1163,82 @@ def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, h
         shape.height.set(height)
     if rotation is not None:
         raw(shape, _ROTATION).set(rotation)
+    if dleft is not None:
+        shape.left_position.set(shape.left_position() + dleft)
+    if dtop is not None:
+        shape.top.set(shape.top() + dtop)
+    if dwidth is not None:
+        shape.width.set(shape.width() + dwidth)
+    if dheight is not None:
+        shape.height.set(shape.height() + dheight)
+
+
+def _geometry_of(shape):
+    # Read back out of PowerPoint rather than echoing what was asked for,
+    # which is also the check that the writes landed.
+    return {
+        "shape_name": shape.name(),
+        "left": round(shape.left_position(), 2),
+        "top": round(shape.top(), 2),
+        "width": round(shape.width(), 2),
+        "height": round(shape.height(), 2),
+    }
+
+
+def _update_many_impl(slide_index, shape_names, all_shapes, exclude,
+                      left, top, width, height, rotation,
+                      dleft, dtop, dwidth, dheight):
+    """The macOS half of ppt_com.shapes._update_many_impl.
+
+    Same selection arithmetic, same all-or-nothing rule. Every shape is
+    addressed by its own reference from one `shapes_of` read, and nothing here
+    reorders, so the references stay good for the whole walk.
+    """
+    from ppt_com.shapes import select_targets
+
+    app = ppt._get_app_impl()
+    goto_slide(app, slide_index)
+    pres = ppt._get_pres_impl()
+    slide = _slide(pres, slide_index)
+
+    shapes = shapes_of(slide)
+    order = [shape.name() for shape in shapes]
+
+    picked = select_targets(order, shape_names, all_shapes, exclude)
+    targets = [shapes[pick] for pick in picked if isinstance(pick, int)]
+    # A name that is not at the top level is simply missing here. Windows
+    # looks inside the groups at this point; nothing can, on this side.
+    missing = [pick for pick in picked if not isinstance(pick, int)]
+    if missing:
+        raise ValueError(
+            "Nothing was moved. These shapes are not on slide "
+            f"{slide_index}: {', '.join(missing)}. On the slide: "
+            f"{', '.join(order)}. A shape inside a group cannot be reached by "
+            "name here, because a group answers no members over Apple Events; "
+            "ppt_ungroup_shapes is the way in."
+        )
+
+    with FrozenRedraw():
+        updated = []
+        for shape in targets:
+            _apply_geometry(shape, left, top, width, height, rotation,
+                            dleft, dtop, dwidth, dheight)
+            updated.append(_geometry_of(shape))
+
+    return {"success": True, "count": len(updated), "updated": updated}
+
+
+def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, height,
+                       rotation, name, adjustments,
+                       dleft=None, dtop=None, dwidth=None, dheight=None):
+    app = ppt._get_app_impl()
+    goto_slide(app, slide_index)
+    pres = ppt._get_pres_impl()
+    slide = _slide(pres, slide_index)
+    shape = _get_shape(slide, None, shape_name=shape_name, shape_index=shape_index)
+
+    _apply_geometry(shape, left, top, width, height, rotation,
+                    dleft, dtop, dwidth, dheight)
     if name is not None:
         shape.name.set(name)
 
@@ -976,16 +1259,7 @@ def _update_shape_impl(slide_index, shape_name, shape_index, left, top, width, h
                 )
             shape.adjustments[idx].adjustment_value.set(value)
 
-    # Read every number back out of PowerPoint rather than echoing what was
-    # asked for, which is also the check that the writes above landed.
-    result = {
-        "success": True,
-        "shape_name": shape.name(),
-        "left": round(shape.left_position(), 2),
-        "top": round(shape.top(), 2),
-        "width": round(shape.width(), 2),
-        "height": round(shape.height(), 2),
-    }
+    result = {"success": True, **_geometry_of(shape)}
 
     # Include current adjustment values in response when adjustments were set.
     if adjustments:
@@ -1115,19 +1389,40 @@ def _presentation_index(app, pres) -> Optional[int]:
 
 
 def _set_zorder_impl(slide_index, shape_name, shape_index, z_order_cmd):
+    from ppt_com.shapes import BEHIND_TEXT
+
     # Translated before goto_slide, so a command macOS has no word for costs
     # neither an Apple Event nor a jump to a slide the caller was not looking
-    # at. The table is local.
-    z_order_word = to_keyword(MsoZOrderCmd, z_order_cmd, "z order command")
+    # at. The table is local. send_behind_text has no word at all, it is a
+    # walk, so it skips the translation.
+    behind_text = z_order_cmd == BEHIND_TEXT
+    z_order_word = (
+        None if behind_text
+        else to_keyword(MsoZOrderCmd, z_order_cmd, "z order command")
+    )
 
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
     slide = _slide(pres, slide_index)
     shape = _get_shape(slide, None, shape_name=shape_name, shape_index=shape_index)
+
+    # The name is read once, before anything moves, and the position is read
+    # off a reference found again afterwards. A reference held across a
+    # `z order` call names whatever shape inherited its index.
+    name = shape.name()
+
+    if behind_text:
+        placed = place_in_zorder(slide, shape, "behind_text")
+        result = {"success": True, "shape_name": name,
+                  "new_z_position": placed["z_position"]}
+        if "note" in placed:
+            result["note"] = placed["note"]
+        return result
+
     shape.z_order(z_order_position=z_order_word)
     return {
         "success": True,
-        "shape_name": shape.name(),
-        "new_z_position": shape.z_order_position(),
+        "shape_name": name,
+        "new_z_position": _refind(slide, name).z_order_position(),
     }

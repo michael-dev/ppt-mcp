@@ -6,13 +6,17 @@ import os
 import re
 import time
 import unicodedata
-from typing import List, Optional, Union
+from typing import Annotated, List, Optional, Union
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, StringConstraints,
+    field_validator, model_validator,
+)
 
 from utils.offload import run_offloaded
 from backend import ppt
 from utils.navigation import goto_slide
+from utils.redraw import FrozenRedraw
 from utils.color import hex_to_int, int_to_hex, int_to_rgb, get_theme_color_index
 from utils.validation import font_size_warning
 from ppt_com.constants import (
@@ -33,40 +37,14 @@ from ppt_com.constants import (
     ppBulletArabicDBPlain, ppBulletArabicDBPeriod,
     msoTextOrientationHorizontal, msoTextOrientationVertical,
     msoTextOrientationUpward, msoTextOrientationDownward,
+    msoAnchorTop, msoAnchorMiddle, msoAnchorBottom,
+    msoAnchorTopBaseline, msoAnchorBottomBaseLine,
+)
+from ppt_com.shape_lookup import (
+    PATH_SEPARATOR, resolve_shape as _get_shape, walk_group_children,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-def _get_shape(slide, name_or_index):
-    """Find shape by name (str) or index (int).
-
-    Args:
-        slide: Slide COM object
-        name_or_index: Shape name (str) or 1-based index (int)
-
-    Returns:
-        Shape COM object
-
-    Raises:
-        ValueError: If shape not found
-    """
-    if isinstance(name_or_index, int):
-        if name_or_index < 1 or name_or_index > slide.Shapes.Count:
-            raise ValueError(
-                f"Shape index {name_or_index} out of range "
-                f"(1-{slide.Shapes.Count})"
-            )
-        return slide.Shapes(name_or_index)
-    else:
-        for i in range(1, slide.Shapes.Count + 1):
-            shape = slide.Shapes(i)
-            if shape.Name == name_or_index:
-                return shape
-        raise ValueError(f"Shape '{name_or_index}' not found on slide")
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +70,26 @@ AUTO_SIZE_MAP = {
     "shape_to_fit": ppAutoSizeShapeToFitText,
     "shrink_to_fit": ppAutoSizeTextToFitShape,
 }
+
+# Module scope so the read side in ppt_com.shapes can name an anchor the same
+# way ppt_set_textframe does, instead of growing a second spelling.
+VERTICAL_ANCHOR_MAP = {
+    "top": msoAnchorTop,
+    "middle": msoAnchorMiddle,
+    "bottom": msoAnchorBottom,
+}
+
+# The read side of the three maps above. ppt_get_shape_info reports a text
+# frame in the words ppt_set_textframe accepts, so what is read back can be
+# written again without a second vocabulary in between.
+AUTO_SIZE_NAMES = {value: name for name, value in AUTO_SIZE_MAP.items()}
+ORIENTATION_NAMES = {value: name for name, value in ORIENTATION_MAP.items()}
+VERTICAL_ANCHOR_NAMES = {value: name for name, value in VERTICAL_ANCHOR_MAP.items()}
+# PowerPoint has two more anchors that ppt_set_textframe does not write. They
+# are named here so reading one reports what it is rather than nothing, and a
+# caller that feeds the name back gets told the name is not writable.
+VERTICAL_ANCHOR_NAMES[msoAnchorTopBaseline] = "top_baseline"
+VERTICAL_ANCHOR_NAMES[msoAnchorBottomBaseLine] = "bottom_baseline"
 
 BULLET_TYPE_MAP = {
     "none": ppBulletNone,
@@ -129,6 +127,92 @@ NUMBERED_STYLE_MAP = {
 # ---------------------------------------------------------------------------
 # Pydantic input models
 # ---------------------------------------------------------------------------
+class TextFormatSpec(BaseModel):
+    """The formatting a span can be given, with no span attached."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    font_name: Optional[str] = Field(default=None, description="Latin font name. Also sets the East Asian font unless font_name_fareast is provided.")
+    font_name_fareast: Optional[str] = Field(default=None, description="East Asian (CJK) font name (e.g. 'BIZ UDPゴシック').")
+    font_size: Optional[float] = Field(default=None, description="Font size in points")
+    bold: Optional[bool] = Field(default=None, description="Bold on/off")
+    italic: Optional[bool] = Field(default=None, description="Italic on/off")
+    underline: Optional[bool] = Field(default=None, description="Underline on/off")
+    color: Optional[str] = Field(default=None, description="Color as '#RRGGBB' hex string")
+    font_color_theme: Optional[str] = Field(default=None, description="Theme color name (e.g. 'accent1', 'dark1')")
+    highlight_color: Optional[str] = Field(
+        default=None,
+        description="Text highlight (marker) color as '#RRGGBB' hex string, or 'clear' to remove highlight. Requires Office 2019+.",
+    )
+
+    @field_validator("highlight_color")
+    @classmethod
+    def validate_highlight_color(cls, v):
+        if v is None or v.lower() == "clear":
+            return v
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", v):
+            raise ValueError("highlight_color must be '#RRGGBB' hex string or 'clear'")
+        return v
+
+
+class RunSpec(TextFormatSpec):
+    """A piece of text and the formatting it is written with."""
+
+    # Not stripped, unlike every other string on these models. A run is a
+    # fragment of a sentence, so its leading and trailing spaces are the gaps
+    # between words, and a trailing newline is the paragraph break the caller
+    # put there. Stripping them silently rewrote the text.
+    text: Annotated[str, StringConstraints(strip_whitespace=False, min_length=1)] = Field(
+        ...,
+        description="The text of this run, kept exactly as given. Use \n for a paragraph break and \v for a line break inside one.",
+    )
+
+
+class TextRangeSpec(TextFormatSpec):
+    """One span of a text frame, and what to do to it.
+
+    Prefer search_text. start is a 1-based character offset into a string
+    where \v counts as one character, so every edit shifts every offset
+    after it, and a miscount colours the wrong words.
+    """
+
+    search_text: Optional[str] = Field(default=None, description="Text to find in the shape. The matching span is formatted. Prefer this over start/length.")
+    occurrence: int = Field(default=1, ge=1, description="Which occurrence of search_text to take (1 = first). Only with search_text.")
+    start: Optional[int] = Field(default=None, description="1-based character start position (mutually exclusive with search_text)")
+    length: Optional[int] = Field(default=None, description="Number of characters (mutually exclusive with search_text)")
+
+    @field_validator("search_text")
+    @classmethod
+    def validate_search_text_not_empty(cls, v):
+        if v is not None and v == "":
+            raise ValueError("search_text must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def validate_span(self):
+        return _check_span(self)
+
+
+def _check_span(spec):
+    """Either search_text, or start and length together. Shared by both models."""
+    has_search = spec.search_text is not None
+    if has_search:
+        if spec.start is not None or spec.length is not None:
+            raise ValueError(
+                "search_text is mutually exclusive with start/length. "
+                "Use either search_text or start+length, not both."
+            )
+    else:
+        if spec.start is None or spec.length is None:
+            raise ValueError(
+                "Either search_text or both start and length must be provided."
+            )
+        if spec.occurrence != 1:
+            raise ValueError(
+                "occurrence is only valid with search_text, not with start/length."
+            )
+    return spec
+
+
 class SetTextInput(BaseModel):
     """Input for setting text content of a shape."""
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -137,15 +221,75 @@ class SetTextInput(BaseModel):
     shape_name_or_index: Union[str, int] = Field(
         ..., description="Shape name (str) or 1-based index (int). Prefer name — indices shift when shapes are added/removed"
     )
-    text: str = Field(
-        ...,
+    text: Optional[str] = Field(
+        default=None,
         description=(
-            "Text content. Use \\n for paragraph breaks (Enter) "
-            "and \\v for line breaks within the same paragraph (Shift+Enter). "
-            "Example: 'First paragraph\\nSecond paragraph' or "
-            "'Line one\\vLine two' (same paragraph, no bullet/indent change)."
+            "Text content. Use \n for paragraph breaks (Enter) "
+            "and \v for line breaks within the same paragraph (Shift+Enter). "
+            "Replaces the whole frame, and with it every run's formatting, "
+            "unless a span is given."
         ),
     )
+    search_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Replace the span matching this text instead of the whole frame. "
+            "The formatting of the replaced text is kept, so a wording change "
+            "costs one call and no offset arithmetic."
+        ),
+    )
+    occurrence: int = Field(default=1, ge=1, description="Which occurrence of search_text to replace (1 = first). Only with search_text.")
+
+    @field_validator("search_text")
+    @classmethod
+    def validate_search_text_not_empty(cls, v):
+        # An empty one matches at position 1 with no length, which would
+        # insert at the front of the shape rather than report the mistake.
+        if v is not None and v == "":
+            raise ValueError("search_text must not be empty")
+        return v
+    start: Optional[int] = Field(
+        default=None, ge=1,
+        description=(
+            "1-based character position of the span to replace. With "
+            "length=0 this inserts, and the inserted text takes the "
+            "formatting of the text before it."
+        ),
+    )
+    length: Optional[int] = Field(
+        default=None, ge=0,
+        description="How many characters the span covers. 0 inserts at start without removing anything.",
+    )
+    runs: Optional[list[RunSpec]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Write the frame as a list of runs, each with its own text and "
+            "formatting, in one call. Use this to build a box whose design "
+            "puts differently sized or coloured words in one sentence, "
+            "instead of setting the text and then formatting each span. "
+            "Mutually exclusive with text."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_what_to_write(self):
+        if (self.text is None) == (self.runs is None):
+            raise ValueError("Provide either text or runs, not both and not neither")
+
+        has_span = (self.start is not None or self.length is not None
+                    or self.search_text is not None)
+        if has_span:
+            if self.runs is not None:
+                raise ValueError(
+                    "runs writes the whole frame, so it cannot take a span. "
+                    "Use text with start/length or search_text to edit part "
+                    "of one."
+                )
+            _check_span(self)
+        elif self.occurrence != 1:
+            raise ValueError("occurrence is only valid with search_text")
+        return self
 
 
 class GetTextInput(BaseModel):
@@ -155,6 +299,17 @@ class GetTextInput(BaseModel):
     slide_index: int = Field(..., description="1-based slide index")
     shape_name_or_index: Union[str, int] = Field(
         ..., description="Shape name (str) or 1-based index (int). Prefer name — indices shift when shapes are added/removed"
+    )
+    measure: bool = Field(
+        default=False,
+        description=(
+            "Also measure the text as PowerPoint draws it: line_count, the "
+            "text and size of every line, the width and height of the whole "
+            "block, the usable width and height (the shape less its margins) "
+            "and whether it overflows. Use this instead of exporting a "
+            "preview image to find out whether a headline wraps. Costs extra "
+            "round trips, so it is off by default."
+        ),
     )
 
 
@@ -227,6 +382,25 @@ class FormatTextRangeInput(BaseModel):
         description="Text highlight (marker) color as '#RRGGBB' hex string, or 'clear' to remove highlight. Requires Office 2019+.",
     )
 
+    base: Optional[TextFormatSpec] = Field(
+        default=None,
+        description=(
+            "Formatting for the whole text frame, applied before ranges. Set "
+            "the ground here and punch the exceptions in ranges, instead of "
+            "a separate ppt_format_text call first. Only with ranges."
+        ),
+    )
+    ranges: Optional[list[TextRangeSpec]] = Field(
+        default=None,
+        description=(
+            "Several spans of one shape, each with its own formatting, in one "
+            "call. Applied in the order given, so a later entry wins where "
+            "they overlap. Use this when a text box carries differently sized "
+            "or coloured words, which is one call rather than one per span, "
+            "and the shape is never seen half styled."
+        ),
+    )
+
     @field_validator("highlight_color")
     @classmethod
     def validate_highlight_color(cls, v):
@@ -247,27 +421,38 @@ class FormatTextRangeInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_range_specification(self):
-        """Ensure either start/length or search_text is provided, not both."""
-        has_start = self.start is not None
-        has_length = self.length is not None
-        has_search = self.search_text is not None
+        """Ensure either start/length or search_text is provided, not both.
 
-        if has_search:
-            if has_start or has_length:
+        Stands down when ranges is used, where each entry carries its own
+        span and the fields out here would have nothing to apply to.
+        """
+        if self.ranges is not None:
+            single = [
+                name for name in (
+                    "start", "length", "search_text", "font_name",
+                    "font_name_fareast", "font_size", "bold", "italic",
+                    "underline", "color", "font_color_theme",
+                    "highlight_color",
+                ) if getattr(self, name) is not None
+            ]
+            if single:
                 raise ValueError(
-                    "search_text is mutually exclusive with start/length. "
-                    "Use either search_text or start+length, not both."
-                )
-        else:
-            if not has_start or not has_length:
-                raise ValueError(
-                    "Either search_text or both start and length must be provided."
+                    f"{', '.join(single)} formats one span, so it cannot be "
+                    "used with ranges. Put the span in ranges, or the "
+                    "frame-wide formatting in base."
                 )
             if self.occurrence != 1:
-                raise ValueError(
-                    "occurrence is only valid with search_text, not with start/length."
-                )
-        return self
+                raise ValueError("occurrence belongs to a ranges entry, not beside it")
+            if not self.ranges:
+                raise ValueError("ranges must not be empty if provided")
+            return self
+
+        if self.base is not None:
+            raise ValueError(
+                "base is the ground under ranges, so it only means something "
+                "with ranges. Formatting one span needs no base."
+            )
+        return _check_span(self)
 
 
 class SetParagraphFormatInput(BaseModel):
@@ -430,13 +615,21 @@ class FindReplaceTextInput(BaseModel):
     shape_name: Optional[str] = Field(
         default=None,
         min_length=1,
-        description="Limit search to a shape with this Name. Applied within each targeted slide.",
+        description="Limit search to a shape with this Name, or, with include_groups, its 'Group/Child' path. Applied within each targeted slide.",
     )
     context_chars: int = Field(
         default=0,
         ge=0,
         le=500,
         description="Include N characters of context before/after each hit in the result.",
+    )
+    include_groups: bool = Field(
+        default=False,
+        description=(
+            "Also search the shapes inside groups. Off by default because it "
+            "widens what a replace touches; turn it on when text you can see "
+            "on the slide is not being found."
+        ),
     )
 
     @field_validator("slide_indices")
@@ -1076,20 +1269,82 @@ def _get_all_text_impl(slide_indices) -> str:
 # ---------------------------------------------------------------------------
 # COM implementation functions (run on COM thread)
 # ---------------------------------------------------------------------------
-def _set_text_impl(slide_index: int, shape_name_or_index, text: str) -> dict:
-    app = ppt._get_app_impl()
-    goto_slide(app, slide_index)
-    pres = ppt._get_pres_impl()
-    slide = pres.Slides(slide_index)
-    shape = _get_shape(slide, shape_name_or_index)
+def _for_powerpoint(text):
+    """A paragraph break is \n to a caller and \r to PowerPoint.
 
-    if not shape.HasTextFrame:
-        raise ValueError(f"Shape '{shape.Name}' does not have a text frame")
+    \v is a line break inside a paragraph and goes through as it is.
+    """
+    return text.replace(chr(10), chr(13))
 
-    tf = shape.TextFrame
-    tr = tf.TextRange
-    text = text.replace('\n', '\r')  # \n -> paragraph break (Enter)
-    # \v (vertical tab) -> line break (Shift+Enter) — passed through as-is
+
+def run_offsets(runs):
+    """The 1-based (start, length) of each run in the text they make together.
+
+    Pure arithmetic, so the part that is easy to get wrong can be tested
+    without PowerPoint. A paragraph break counts as the one character
+    PowerPoint stores.
+    """
+    spans = []
+    at = 1
+    for run in runs:
+        length = len(_for_powerpoint(run["text"]))
+        spans.append((at, length))
+        at += length
+    return spans
+
+
+def _set_text_impl(slide_index: int, shape_name_or_index, text,
+                   start=None, length=None, search_text=None, occurrence=1,
+                   runs=None) -> dict:
+    shape, tr = _text_frame_of(slide_index, shape_name_or_index)
+
+    if runs is not None:
+        for spec in runs:
+            _check_format_spec(spec)
+        spans = run_offsets(runs)
+        with FrozenRedraw():
+            tr.Text = _for_powerpoint("".join(run["text"] for run in runs))
+            for (run_start, run_length), spec in zip(spans, runs):
+                if run_length:
+                    _format_span(shape, tr, run_start, run_length, spec)
+        return {
+            "status": "success",
+            "slide_index": slide_index,
+            "shape_name": shape.Name,
+            "text_length": tr.Length,
+            "paragraph_count": tr.Paragraphs().Count,
+            # The spans as written, not PowerPoint's own runs. Two adjacent
+            # pieces asking for the same formatting come back from COM as one
+            # run, which is true and unhelpful when the question is where
+            # each piece of the request landed.
+            "runs": [
+                {"index": i, "text": run["text"],
+                 "start": run_start, "length": run_length}
+                for i, ((run_start, run_length), run)
+                in enumerate(zip(spans, runs), start=1)
+            ],
+        }
+
+    text = _for_powerpoint(text)
+
+    if start is not None or search_text is not None:
+        start, length = _resolve_span(
+            tr.Text, shape.Name, start, length, search_text, occurrence)
+        # PowerPoint keeps the formatting of the characters being replaced and
+        # shifts everything after them itself. An empty span inherits what is
+        # in front of it, which is what appending to a run means.
+        tr.Characters(Start=start, Length=length).Text = text
+        return {
+            "status": "success",
+            "slide_index": slide_index,
+            "shape_name": shape.Name,
+            "text": tr.Text,
+            "text_length": tr.Length,
+            "start": start,
+            "replaced_length": length,
+            "written_length": len(text),
+        }
+
     tr.Text = text
 
     return {
@@ -1101,7 +1356,131 @@ def _set_text_impl(slide_index: int, shape_name_or_index, text: str) -> dict:
     }
 
 
-def _get_text_impl(slide_index: int, shape_name_or_index) -> dict:
+# Half a point of slack. PowerPoint reports bounds it computed in EMU, so a
+# line that fits exactly can come back a hundredth of a point over.
+_FIT_TOLERANCE_PT = 0.5
+
+
+# The orientations whose lines run down the box rather than across it. In a
+# vertical frame a line is a column, so wrapping is limited by the height and
+# the block grows sideways. Upward and downward rotate the glyphs and keep
+# that same geometry, which PowerPoint's own bounds confirm.
+_VERTICAL_FLOW = frozenset({"vertical", "upward", "downward"})
+
+
+def build_measurement(lines, text_width, text_height,
+                      shape_width, shape_height, margins,
+                      word_wrap, autofit, orientation):
+    """Turn measured bounds into the answer a caller asked the question for.
+
+    Kept apart from the reading so the arithmetic can be tested without
+    PowerPoint, and so both platforms compute overflow the same way.
+
+    `margins` is the four sided dict ppt_get_shape_info reports, or None when
+    PowerPoint would not answer. Without it there is no usable size and no
+    honest overflow answer, so both come back None rather than guessed.
+
+    Overflow shows on the axis wrapping does not control. Wrapping ends a
+    horizontal line at the box width, so what is left to overflow is the
+    height; in a vertical frame it ends a column at the box height and the
+    width is what is left. The other axis is only checked once wrapping is
+    off, because with it on a long line becomes another line rather than a
+    line that sticks out.
+
+    A bound PowerPoint would not answer makes the verdict None. Reporting
+    "fits" for something that was never measured is the one answer that
+    cannot be recovered from.
+    """
+    measurement = {
+        "line_count": len(lines),
+        "lines": lines,
+        "text_width_pt": text_width,
+        "text_height_pt": text_height,
+        "usable_width_pt": None,
+        "usable_height_pt": None,
+        "overflows": None,
+        "autofit": autofit,
+    }
+
+    if margins is None:
+        return measurement
+
+    usable_width = round(shape_width - margins["left"] - margins["right"], 2)
+    usable_height = round(shape_height - margins["top"] - margins["bottom"], 2)
+    measurement["usable_width_pt"] = usable_width
+    measurement["usable_height_pt"] = usable_height
+
+    if orientation in _VERTICAL_FLOW:
+        checks = [(text_width, usable_width)]
+        if word_wrap is False:
+            checks.append((text_height, usable_height))
+    else:
+        checks = [(text_height, usable_height)]
+        if word_wrap is False:
+            checks.append((text_width, usable_width))
+
+    if any(measured is None for measured, _ in checks):
+        return measurement
+
+    measurement["overflows"] = any(
+        measured > limit + _FIT_TOLERANCE_PT for measured, limit in checks
+    )
+
+    return measurement
+
+
+def _measure_text(shape, tf, tr):
+    """Measure a text frame as PowerPoint currently draws it.
+
+    The numbers are the drawn ones. A frame set to shrink text to fit and
+    actually shrinking it answers the shrunk size, and then `overflows` is
+    false because the shrinking is what made it fit. `autofit` is in the block
+    so that reads the right way round; ppt_check_typography is what measures
+    the size the text would have wanted.
+    """
+    from ppt_com.shapes import _text_frame_state
+
+    state = _text_frame_state(shape) or {}
+
+    lines = []
+    try:
+        line_count = tr.Lines().Count
+    except Exception:
+        line_count = 0
+    for i in range(1, line_count + 1):
+        line = tr.Lines(i)
+        entry = {"text": None, "width_pt": None, "height_pt": None}
+        try:
+            entry["text"] = line.Text
+        except Exception:
+            pass
+        try:
+            entry["width_pt"] = round(line.BoundWidth, 2)
+        except Exception:
+            pass
+        try:
+            entry["height_pt"] = round(line.BoundHeight, 2)
+        except Exception:
+            pass
+        lines.append(entry)
+
+    # An empty frame has no bounds to report, and asking for them raises.
+    text_width = text_height = None
+    try:
+        text_width = round(tr.BoundWidth, 2)
+        text_height = round(tr.BoundHeight, 2)
+    except Exception:
+        pass
+
+    return build_measurement(
+        lines, text_width, text_height,
+        round(shape.Width, 2), round(shape.Height, 2),
+        state.get("margins"), state.get("word_wrap"), state.get("autofit"),
+        state.get("orientation"),
+    )
+
+
+def _get_text_impl(slide_index: int, shape_name_or_index, measure=False) -> dict:
     app = ppt._get_app_impl()
     pres = ppt._get_pres_impl()
     slide = pres.Slides(slide_index)
@@ -1154,6 +1533,9 @@ def _get_text_impl(slide_index: int, shape_name_or_index) -> dict:
         }
         runs.append(run_info)
     result["runs"] = runs
+
+    if measure:
+        result["measurement"] = _measure_text(shape, tf, tr)
 
     return result
 
@@ -1370,56 +1752,127 @@ def _format_text_impl(slide_index, shape_name_or_index,
     }
 
 
-def _format_text_range_impl(slide_index, shape_name_or_index, start, length,
-                              search_text, occurrence,
-                              font_name, font_name_fareast, font_size, bold, italic, underline,
-                              color, font_color_theme, highlight_color) -> dict:
+def _resolve_span(full_text, shape_name, start, length, search_text, occurrence):
+    """Turn a span description into 1-based (start, length).
+
+    Kept apart because a batch resolves every span against the text as it
+    stands before anything is written, so one entry cannot shift another.
+    """
+    if search_text is None:
+        return start, length
+
+    pos = -1
+    search_from = 0
+    for i in range(occurrence):
+        pos = full_text.find(search_text, search_from)
+        if pos == -1:
+            if i == 0:
+                raise ValueError(
+                    f"search_text '{search_text}' not found in shape '{shape_name}'"
+                )
+            raise ValueError(
+                f"search_text '{search_text}' has only {i} occurrence(s) "
+                f"in shape '{shape_name}', but occurrence={occurrence} was requested"
+            )
+        search_from = pos + len(search_text)
+    # COM Characters() is 1-based
+    return pos + 1, len(search_text)
+
+
+def _check_format_spec(spec):
+    """Run the conversions that can refuse a value, and throw the result away.
+
+    A colour is only rejected when it is written, so in a batch a bad value
+    in the fourth entry used to leave the first three applied. Every entry is
+    checked here before the first one is written.
+    """
+    if spec.get("color") is not None:
+        hex_to_int(spec["color"])
+    if spec.get("font_color_theme") is not None:
+        get_theme_color_index(spec["font_color_theme"])
+
+
+def _format_span(shape, tr, start, length, spec) -> dict:
+    """Apply one span's formatting and report what it landed on."""
+    target = tr.Characters(Start=start, Length=length)
+    _apply_font_props(
+        target.Font, spec.get("font_name"), spec.get("font_name_fareast"),
+        spec.get("font_size"), spec.get("bold"), spec.get("italic"),
+        spec.get("underline"), spec.get("color"), spec.get("font_color_theme"),
+    )
+    if spec.get("highlight_color") is not None:
+        _apply_highlight(shape, spec["highlight_color"], start, length)
+    return {
+        "formatted_text": target.Text,
+        "start": target.Start,
+        "length": target.Length,
+    }
+
+
+def _text_frame_of(slide_index, shape_name_or_index):
     app = ppt._get_app_impl()
     goto_slide(app, slide_index)
     pres = ppt._get_pres_impl()
     slide = pres.Slides(slide_index)
     shape = _get_shape(slide, shape_name_or_index)
-
     if not shape.HasTextFrame:
         raise ValueError(f"Shape '{shape.Name}' does not have a text frame")
+    return shape, shape.TextFrame.TextRange
 
-    tr = shape.TextFrame.TextRange
 
-    # Resolve search_text to start/length if provided
-    if search_text is not None:
-        full_text = tr.Text
-        pos = -1
-        search_from = 0
-        for i in range(occurrence):
-            pos = full_text.find(search_text, search_from)
-            if pos == -1:
-                if i == 0:
-                    raise ValueError(
-                        f"search_text '{search_text}' not found in shape '{shape.Name}'"
-                    )
-                else:
-                    raise ValueError(
-                        f"search_text '{search_text}' has only {i} occurrence(s) "
-                        f"in shape '{shape.Name}', but occurrence={occurrence} was requested"
-                    )
-            search_from = pos + len(search_text)
-        # COM Characters() is 1-based
-        start = pos + 1
-        length = len(search_text)
+def _format_text_ranges_impl(slide_index, shape_name_or_index, base, ranges) -> dict:
+    """Format several spans of one shape, with an optional ground under them.
 
-    target = tr.Characters(Start=start, Length=length)
-    _apply_font_props(target.Font, font_name, font_name_fareast, font_size, bold, italic, underline, color, font_color_theme)
+    Every span is resolved against the text before anything is written, so a
+    search that fails leaves the shape alone rather than half styled. The
+    writes then go inside one freeze, because a box restyled a span at a time
+    is visibly restyled a span at a time to anyone watching the window.
+    """
+    shape, tr = _text_frame_of(slide_index, shape_name_or_index)
 
-    if highlight_color is not None:
-        _apply_highlight(shape, highlight_color, start, length)
+    full_text = tr.Text
+    spans = [
+        _resolve_span(full_text, shape.Name, spec.get("start"),
+                      spec.get("length"), spec.get("search_text"),
+                      spec.get("occurrence", 1))
+        for spec in ranges
+    ]
+    for spec in ([base] if base else []) + list(ranges):
+        _check_format_spec(spec)
+
+    with FrozenRedraw():
+        if base:
+            _format_span(shape, tr, 1, len(full_text), base)
+        applied = [
+            _format_span(shape, tr, start, length, spec)
+            for (start, length), spec in zip(spans, ranges)
+        ]
 
     return {
         "status": "success",
         "shape_name": shape.Name,
-        "formatted_text": target.Text,
-        "start": target.Start,
-        "length": target.Length,
+        "count": len(applied),
+        "ranges": applied,
     }
+
+
+def _format_text_range_impl(slide_index, shape_name_or_index, start, length,
+                              search_text, occurrence,
+                              font_name, font_name_fareast, font_size, bold, italic, underline,
+                              color, font_color_theme, highlight_color) -> dict:
+    shape, tr = _text_frame_of(slide_index, shape_name_or_index)
+
+    start, length = _resolve_span(
+        tr.Text, shape.Name, start, length, search_text, occurrence)
+    applied = _format_span(shape, tr, start, length, {
+        "font_name": font_name, "font_name_fareast": font_name_fareast,
+        "font_size": font_size, "bold": bold, "italic": italic,
+        "underline": underline, "color": color,
+        "font_color_theme": font_color_theme,
+        "highlight_color": highlight_color,
+    })
+
+    return {"status": "success", "shape_name": shape.Name, **applied}
 
 
 def _set_paragraph_format_impl(slide_index, shape_name_or_index, paragraph_index,
@@ -1561,6 +2014,25 @@ def _set_bullet_impl(slide_index, shape_name_or_index, paragraph_index,
     }
 
 
+def _searchable_shapes(slide, include_groups):
+    """Every shape on the slide that a text search should look at.
+
+    Yields (shape, path). The path is the name for a shape at the top level
+    and "Group/Child" for one inside a group, which is what a caller feeds
+    back to reach it again.
+
+    Groups used to be skipped without saying so: a group has no text frame of
+    its own, so the loop walked past it and the text inside was simply never
+    searched. Nothing reported that, and filtering by a child's name returned
+    no matches rather than an error.
+    """
+    for si in range(1, slide.Shapes.Count + 1):
+        shape = slide.Shapes(si)
+        yield shape, shape.Name
+        if include_groups:
+            yield from walk_group_children(shape, shape.Name + PATH_SEPARATOR)
+
+
 def _find_replace_text_impl(
     find_text,
     replace_text,
@@ -1570,6 +2042,7 @@ def _find_replace_text_impl(
     slide_indices,
     shape_name,
     context_chars,
+    include_groups,
 ) -> dict:
     pres = ppt._get_pres_impl()
     find_only = replace_text is None or dry_run
@@ -1590,9 +2063,10 @@ def _find_replace_text_impl(
 
     hits = []
     for slide in slides_to_search:
-        for si in range(1, slide.Shapes.Count + 1):
-            shape = slide.Shapes(si)
-            if shape_name is not None and shape.Name != shape_name:
+        for shape, path in _searchable_shapes(slide, include_groups):
+            # A child answers to its own name and to its path, so a caller
+            # that read either out of ppt_get_group_items can filter with it.
+            if shape_name is not None and shape_name not in (shape.Name, path):
                 continue
             if not shape.HasTextFrame:
                 continue
@@ -1607,6 +2081,7 @@ def _find_replace_text_impl(
                     hit = {
                         "slide_index": slide.SlideIndex,
                         "shape_name": shape.Name,
+                        "shape_path": path,
                         "start": match.Start,
                         "length": match.Length,
                     }
@@ -1630,6 +2105,7 @@ def _find_replace_text_impl(
                     hit = {
                         "slide_index": slide.SlideIndex,
                         "shape_name": shape.Name,
+                        "shape_path": path,
                         "start": match.Start,
                         "length": match.Length,
                     }
@@ -1709,11 +2185,6 @@ def _set_textframe_impl(slide_index, shape_name_or_index,
         shape.TextFrame2.AutoSize = auto_size_val
 
     if vertical_anchor is not None:
-        VERTICAL_ANCHOR_MAP = {
-            "top": 1,       # msoAnchorTop
-            "middle": 3,    # msoAnchorMiddle
-            "bottom": 4,    # msoAnchorBottom
-        }
         anchor_val = VERTICAL_ANCHOR_MAP.get(vertical_anchor.lower())
         if anchor_val is None:
             raise ValueError(
@@ -1732,21 +2203,51 @@ def _set_textframe_impl(slide_index, shape_name_or_index,
 # MCP tool functions
 # ---------------------------------------------------------------------------
 def set_text(params: SetTextInput) -> str:
-    """Set the entire text content of a shape."""
+    """Set the text of a shape, of a span of it, or write it as runs.
+
+    With no span, this replaces the whole frame and with it every run's
+    formatting. A span, given as start and length or as search_text, replaces
+    only that much and PowerPoint keeps the formatting of what it replaced,
+    so changing a word costs one call. length=0 inserts, taking the
+    formatting of the text in front of it.
+
+    runs writes the frame as a list of pieces, each with its own formatting,
+    which is the rebuild in one call rather than one per run with offsets to
+    recompute after every edit.
+    """
     try:
         result = ppt.execute(
-            _set_text_impl, params.slide_index, params.shape_name_or_index, params.text
+            _set_text_impl, params.slide_index, params.shape_name_or_index,
+            params.text, params.start, params.length,
+            params.search_text, params.occurrence,
+            [run.model_dump() for run in params.runs]
+            if params.runs is not None else None,
         )
+        sizes = [run.font_size for run in params.runs] if params.runs else []
+        warnings = [w for w in (font_size_warning(size) for size in sizes) if w]
+        if warnings:
+            result["warnings"] = sorted(
+                set(result.get("warnings", [])) | set(warnings))
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 def get_text(params: GetTextInput) -> str:
-    """Get text content and formatting info from a shape."""
+    """Get text content and formatting info from a shape.
+
+    With measure=True the result also carries a measurement block: line_count,
+    every line with its own width and height, the width and height of the
+    whole block, the usable width and height (the shape less its margins),
+    whether it overflows, and the frame's autofit setting. The numbers are
+    what PowerPoint draws now, so a frame that is shrinking text answers the
+    shrunk size and then does not overflow; ppt_check_typography is what
+    measures the size the text wanted.
+    """
     try:
         result = ppt.execute(
-            _get_text_impl, params.slide_index, params.shape_name_or_index
+            _get_text_impl, params.slide_index, params.shape_name_or_index,
+            params.measure,
         )
         return json.dumps(result)
     except Exception as e:
@@ -1773,8 +2274,33 @@ def format_text(params: FormatTextInput) -> str:
 
 
 def format_text_range(params: FormatTextRangeInput) -> str:
-    """Format a specific character range within a shape's text."""
+    """Format a character range within a shape's text, or several at once.
+
+    With ranges, every span is formatted in one call, over an optional base
+    applied to the whole frame first. That is the shape of a text box whose
+    design puts a word at 50pt in magenta inside a sentence at 28pt, which
+    otherwise costs one call for the frame and one per span, repeated in full
+    after every wording change.
+    """
     try:
+        if params.ranges is not None:
+            result = ppt.execute(
+                _format_text_ranges_impl,
+                params.slide_index, params.shape_name_or_index,
+                params.base.model_dump() if params.base else None,
+                [spec.model_dump() for spec in params.ranges],
+            )
+            sizes = [params.base.font_size] if params.base else []
+            sizes += [spec.font_size for spec in params.ranges]
+            warnings = [w for w in (font_size_warning(size) for size in sizes) if w]
+            if warnings:
+                # Merged, not assigned: macOS answers here with its own
+                # warnings for formatting that did not land, and losing those
+                # would hide that part of the call did nothing.
+                result["warnings"] = sorted(
+                    set(result.get("warnings", [])) | set(warnings))
+            return json.dumps(result)
+
         result = ppt.execute(
             _format_text_range_impl,
             params.slide_index, params.shape_name_or_index,
@@ -1846,6 +2372,7 @@ def find_replace_text(params: FindReplaceTextInput) -> str:
             params.slide_indices,
             params.shape_name,
             params.context_chars,
+            params.include_groups,
         )
         return json.dumps(result)
     except Exception as e:
@@ -2369,14 +2896,27 @@ def register_tools(mcp):
         },
     )
     async def tool_ppt_set_text(params: SetTextInput) -> str:
-        """Set the entire text content of a shape.
+        """Set the text of a shape, of a span of it, or write it as runs.
 
-        Replaces all existing text.
-        \\n = paragraph break (Enter) — starts a new paragraph with its own
+        \n = paragraph break (Enter), starts a new paragraph with its own
         bullet/numbering and indent level.
-        \\v = line break (Shift+Enter) — soft return within the same paragraph,
-        preserving bullet/indent. Use \\v for wrapping at natural word
-        boundaries within one paragraph.
+        \v = line break (Shift+Enter), a soft return inside one paragraph,
+        keeping its bullet and indent.
+
+        **Text alone replaces the whole frame, and flattens it to one run.**
+        Everything below exists so that a wording change need not cost the
+        formatting.
+
+        - **search_text**: replace the span that matches. PowerPoint keeps the
+          formatting of the replaced text, so this is one call and no offsets.
+        - **start + length**: replace that span. length=0 inserts at start,
+          and the inserted text takes the formatting of the text in front of
+          it, which is what appending to a run means.
+        - **runs**: write the frame as a list of pieces, each with its own
+          font, size and colour, in one call.
+
+        To change the same wording everywhere rather than in one shape, use
+        ppt_find_replace_text, which also keeps the runs it does not touch.
         """
         return await run_offloaded(set_text, params)
 
@@ -2395,6 +2935,11 @@ def register_tools(mcp):
 
         Returns the full text, paragraph info (alignment, indent level),
         and per-run formatting (font, size, bold, italic, color).
+
+        Pass measure=True to also get the text measured as drawn: line_count,
+        per-line width and height, the block's width and height, the usable
+        width and height, and overflows. That answers "does this headline
+        wrap" without exporting a preview image and reading the picture.
         """
         return await run_offloaded(get_text, params)
 
@@ -2427,13 +2972,21 @@ def register_tools(mcp):
         },
     )
     async def tool_ppt_format_text_range(params: FormatTextRangeInput) -> str:
-        """Format a specific character range within a shape's text.
+        """Format a character range within a shape's text, or several at once.
 
-        Target range can be specified in two ways (mutually exclusive):
-        1. **start + length**: Characters(start, length) — start is 1-based.
-           Example: to bold characters 3 through 7, use start=3, length=5.
-        2. **search_text**: Search for the text and format the matching range.
-           Use occurrence to target the Nth match (default: 1st).
+        Target a range in two ways (mutually exclusive):
+        1. **search_text**: the matching span is formatted. Prefer this. Use
+           occurrence for the Nth match (default: 1st).
+        2. **start + length**: Characters(start, length), start is 1-based
+           and counts  as one character, so every edit shifts every offset
+           after it.
+
+        For a box with several differently formatted spans, pass **ranges**,
+        a list of entries each carrying its own span and formatting, plus an
+        optional **base** applied to the whole frame first. Set the ground in
+        base, punch the exceptions in ranges. Entries apply in order, so a
+        later one wins where they overlap. One call instead of one for the
+        frame and one per span, and the box is never seen half styled.
         """
         return await run_offloaded(format_text_range, params)
 
@@ -2517,13 +3070,17 @@ def register_tools(mcp):
 
         Output:
         - `match_count` and `matches` (each with `slide_index`, `shape_name`,
-          `start`, `length`, and `context` when `context_chars > 0`).
+          `shape_path`, `start`, `length`, and `context` when
+          `context_chars > 0`). `shape_path` is the name for a shape at the
+          top level and `Group/Child` for one inside a group.
         - In replace mode, `length` and the bracketed segment in `context`
           reflect the replacement text (i.e. what is now in the slide), not
           the original `find_text`.
 
-        Targets only shapes where `HasTextFrame` is true. Table cells, grouped
-        shapes, speaker notes, and SmartArt are not searched.
+        Targets only shapes where `HasTextFrame` is true. Table cells,
+        speaker notes and SmartArt are not searched. Shapes inside a group are
+        not either, until `include_groups` is set; text that is plainly on the
+        slide and reported as not found is usually in one.
 
         Note: `readOnlyHint` is `False` because the tool can write. In
         find-only / dry-run mode the tool performs no writes, but the hint is
