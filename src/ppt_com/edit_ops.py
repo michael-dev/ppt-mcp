@@ -84,6 +84,8 @@ class ExecuteMsoInput(BaseModel):
 # ---------------------------------------------------------------------------
 def _undo_impl(times):
     app = ppt._get_app_impl()
+    # Undo acts on the active window; make that the target deck's.
+    ppt._activate_target_window_for_command_impl()
     count = 0
     for _ in range(times):
         if not app.CommandBars.GetEnabledMso("Undo"):
@@ -95,6 +97,7 @@ def _undo_impl(times):
 
 def _redo_impl(times):
     app = ppt._get_app_impl()
+    ppt._activate_target_window_for_command_impl()
     count = 0
     for _ in range(times):
         if not app.CommandBars.GetEnabledMso("Redo"):
@@ -153,6 +156,7 @@ def _start_undo_entry_impl():
 
 def _execute_mso_impl(command_name, check_enabled):
     app = ppt._get_app_impl()
+    ppt._activate_target_window_for_command_impl()
 
     if check_enabled:
         enabled = app.CommandBars.GetEnabledMso(command_name)

@@ -937,6 +937,33 @@ class PowerPointCOMWrapper:
             logger.warning("Could not activate presentation window: %s", e)
         return window
 
+    def _activate_target_window_for_command_impl(self) -> None:
+        """Internal: make sure a CommandBars command reaches the target deck.
+
+        CommandBars.ExecuteMso (Undo, Redo, any ribbon command) acts on the
+        active window, whichever presentation that belongs to.  With a target
+        set, per call or for the session, this brings the target's window to
+        the front first, and raises RuntimeError if it does not get there:
+        undoing the last edit of some other deck is worse than not undoing.
+        With no target set, the active window is what the caller means and
+        nothing is done.
+        """
+        app = self._get_app_impl()
+        pres = self._find_target_pres_impl(app)
+        if pres is None:
+            return
+        self._activate_target_window_impl()
+        try:
+            active = app.ActiveWindow.Presentation.FullName
+        except Exception:
+            active = None
+        if active != pres.FullName:
+            raise RuntimeError(
+                f"The window of '{pres.Name}' could not be brought to the "
+                "front, and this command acts on the active window, which "
+                "belongs to another presentation. Nothing was run."
+            )
+
     def _set_target_pres_impl(self, name_or_index) -> dict:
         """Internal: set session-level target presentation on COM thread."""
         app = self._get_app_impl()
