@@ -5,9 +5,10 @@ app.ActiveWindow, whichever presentation either belonged to. With two decks
 open, ppt_undo could undo the last edit of the deck the target is not.
 
 The ExecuteMso tools now bring the target's window to the front first and
-refuse when it does not get there; ppt_get_selection reads the target's own
-window without activating anything (issue #183). With no target set,
-behaviour is unchanged.
+refuse when it does not get there; Undo and Redo then hand the front back to
+the window that had it, since they leave nothing to look at. ppt_get_selection
+reads the target's own window without activating anything (issue #183). With
+no target set, behaviour is unchanged.
 
 No COM and no PowerPoint required.
 """
@@ -103,6 +104,26 @@ def test_a_target_without_a_window_is_refused():
         w._activate_target_window_for_command_impl()
 
 
+def test_the_window_that_gave_way_is_returned():
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=1)
+    w = _wrapper_with(app)
+    w._target_pres_full_name = "C:/a.pptx"
+    assert w._activate_target_window_for_command_impl() is b.Windows(1)
+
+
+def test_nothing_is_returned_when_the_target_was_already_in_front():
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=0)
+    w = _wrapper_with(app)
+    w._target_pres_full_name = "C:/a.pptx"
+    assert w._activate_target_window_for_command_impl() is None
+
+
+def test_nothing_is_returned_without_a_target():
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=1)
+    w = _wrapper_with(app)
+    assert w._activate_target_window_for_command_impl() is None
+
+
 # ---------------------------------------------------------------------------
 # The tools
 # ---------------------------------------------------------------------------
@@ -127,6 +148,65 @@ def test_commandbars_run_in_the_target_window(impl, args, command):
         getattr(edit_ops, impl)(*args)
 
     assert window_at_command == [(command, a.Windows(1))]
+
+
+@pytest.mark.parametrize("impl", ["_undo_impl", "_redo_impl"])
+def test_undo_and_redo_hand_the_front_back(impl):
+    import ppt_com.edit_ops as edit_ops
+
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=1)
+    w = _wrapper_with(app)
+    w._target_pres_full_name = "C:/a.pptx"
+    app.CommandBars.GetEnabledMso.return_value = True
+
+    with patch.object(edit_ops, "ppt", w):
+        getattr(edit_ops, impl)(2)
+
+    assert app.ActiveWindow is b.Windows(1)
+
+
+def test_the_front_is_handed_back_when_the_command_fails():
+    import ppt_com.edit_ops as edit_ops
+
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=1)
+    w = _wrapper_with(app)
+    w._target_pres_full_name = "C:/a.pptx"
+    app.CommandBars.GetEnabledMso.return_value = True
+    app.CommandBars.ExecuteMso.side_effect = RuntimeError("boom")
+
+    with patch.object(edit_ops, "ppt", w), pytest.raises(RuntimeError, match="boom"):
+        edit_ops._undo_impl(1)
+    assert app.ActiveWindow is b.Windows(1)
+
+
+def test_undo_moves_nothing_when_the_target_was_already_in_front():
+    import ppt_com.edit_ops as edit_ops
+
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=0)
+    w = _wrapper_with(app)
+    w._target_pres_full_name = "C:/a.pptx"
+    app.CommandBars.GetEnabledMso.return_value = True
+
+    with patch.object(edit_ops, "ppt", w):
+        edit_ops._undo_impl(1)
+
+    assert app.ActiveWindow is a.Windows(1)
+    b.Windows(1).Activate.assert_not_called()
+
+
+def test_execute_mso_leaves_the_target_in_front():
+    # A ribbon command can open a pane or a dialog on the target's window,
+    # or start its slide show, so the front is not handed back there.
+    import ppt_com.edit_ops as edit_ops
+
+    app, (a, b) = _make_app("C:/a.pptx", "C:/b.pptx", active=1)
+    w = _wrapper_with(app)
+    w._target_pres_full_name = "C:/a.pptx"
+
+    with patch.object(edit_ops, "ppt", w):
+        edit_ops._execute_mso_impl("Bold", False)
+
+    assert app.ActiveWindow is a.Windows(1)
 
 
 def test_commandbars_are_not_run_when_the_target_cannot_be_reached():

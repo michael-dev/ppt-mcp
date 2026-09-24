@@ -937,7 +937,7 @@ class PowerPointCOMWrapper:
             logger.warning("Could not activate presentation window: %s", e)
         return window
 
-    def _activate_target_window_for_command_impl(self) -> None:
+    def _activate_target_window_for_command_impl(self) -> Optional[Any]:
         """Internal: make sure a CommandBars command reaches the target deck.
 
         CommandBars.ExecuteMso (Undo, Redo, any ribbon command) acts on the
@@ -947,11 +947,21 @@ class PowerPointCOMWrapper:
         undoing the last edit of some other deck is worse than not undoing.
         With no target set, the active window is what the caller means and
         nothing is done.
+
+        Returns the window that was active before, when another deck's window
+        had to give way, so that a caller whose command leaves nothing to look
+        at (Undo, Redo) can hand the front back; None when nothing moved.
         """
         app = self._get_app_impl()
         pres = self._find_target_pres_impl(app)
         if pres is None:
-            return
+            return None
+        try:
+            previous = app.ActiveWindow
+            if previous.Presentation.FullName == pres.FullName:
+                previous = None
+        except Exception:
+            previous = None
         self._activate_target_window_impl()
         try:
             active = app.ActiveWindow.Presentation.FullName
@@ -963,6 +973,7 @@ class PowerPointCOMWrapper:
                 "front, and this command acts on the active window, which "
                 "belongs to another presentation. Nothing was run."
             )
+        return previous
 
     def _set_target_pres_impl(self, name_or_index) -> dict:
         """Internal: set session-level target presentation on COM thread."""
