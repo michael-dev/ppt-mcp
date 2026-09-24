@@ -307,7 +307,8 @@ def test_every_presentation_bound_tool_advertises_the_argument():
         if tool.name in without:
             assert server.PRESENTATION_ARG not in props, tool.name
         else:
-            assert props.get(server.PRESENTATION_ARG, {}).get("type") == "string", tool.name
+            # Type only: a description would be repeated in every schema.
+            assert props.get(server.PRESENTATION_ARG) == {"type": "string"}, tool.name
             assert server.PRESENTATION_ARG not in required, tool.name
     assert server._presentation_arg_count == len(names - without)
 

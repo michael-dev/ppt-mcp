@@ -147,20 +147,10 @@ _TOOLS_WITHOUT_PRESENTATION_ARG = frozenset({
     "ppt_search_icons", "ppt_slideshow_stop", "ppt_slideshow_next",
     "ppt_slideshow_previous", "ppt_slideshow_goto", "ppt_slideshow_get_status",
 })
-_PRESENTATION_ARG_SCHEMA = {
-    "type": "string",
-    "title": "Presentation",
-    "description": (
-        "The presentation this call works on: its full_name (full path or URL, "
-        "as returned by ppt_activate_presentation, ppt_open_presentation or "
-        "ppt_create_presentation), its file name, or its file name without "
-        "extension. Applies to this call only and leaves the activated "
-        "presentation unchanged. Pass it on every call when other clients or "
-        "conversations may be using PowerPoint at the same time: the activated "
-        "presentation is shared by everything this server serves. If omitted, "
-        "the activated presentation is used."
-    ),
-}
+# Type only. The same entry is copied into every bound tool's schema, and a
+# description there would be sent 141 times per connection (about 80,000
+# characters); the server instructions explain the argument once instead.
+_PRESENTATION_ARG_SCHEMA = {"type": "string"}
 
 
 class _PowerPointServer(MCPServer):
@@ -206,7 +196,7 @@ mcp = _PowerPointServer(
     instructions="""
 ## Getting started
 
-1. Call `ppt_activate_presentation` first — locks all tools to a specific file and prevents accidental edits to the wrong presentation. The activated presentation is shared by every conversation this server serves, so also pass its `full_name` as `presentation` on every further call: that keeps the call on your file even when another conversation activates a different one.
+1. Call `ppt_activate_presentation` first — locks all tools to a specific file and prevents accidental edits to the wrong presentation. The activated presentation is shared by every conversation this server serves, so also pass its `full_name` as `presentation` on every further call: that keeps the call on your file even when another conversation activates a different one. Every tool that works on a presentation takes this optional `presentation` argument next to `params`. It accepts a `full_name` (as returned by `ppt_activate_presentation` or `ppt_open_presentation`), a file name, or a file name without extension; a new unsaved deck goes by the `name` that `ppt_create_presentation` returns. It applies to that call only and never changes the activated presentation. A presentation that is not open is an error, never a fallback to another one.
 2. Call `ppt_get_presentation_info` to understand the presentation — slide count, dimensions, template, current default fonts, and accent colors. Use this to inform all subsequent decisions. When saving files (e.g., exported markdown, images), use the presentation's `local_dir` from `ppt_get_presentation_info` as the default save directory. To read the existing slide content, call `ppt_get_all_text` — it returns all text as pseudo-Markdown with layout analysis, heading detection, and formatting markers.
 3. When adding slides, use `ppt_add_slide` with `count` to create multiple slides at once instead of calling it repeatedly.
 4. After placing text, set fonts explicitly with `ppt_batch_apply_formatting` or `ppt_set_default_fonts`. On Japanese-locale systems, the slide master default is often 游ゴシック, which renders thin and illegible when projected. """ + _PREFERRED_FONTS + """
