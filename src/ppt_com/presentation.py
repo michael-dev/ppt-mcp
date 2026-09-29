@@ -105,7 +105,10 @@ class OpenPresentationInput(BaseModel):
 
     file_path: str = Field(
         ...,
-        description="Full path to the presentation file (.pptx, .pptm, .ppt, .potx, etc.).",
+        description=(
+            "Full path to the presentation file (.pptx, .pptm, .ppt, .potx, etc.), "
+            "or, on Windows, the https:// URL of a file in SharePoint or OneDrive."
+        ),
     )
     read_only: bool = Field(
         default=False,
@@ -408,7 +411,10 @@ def _open_presentation_impl(
     with_window: bool,
     activate: bool,
 ) -> dict:
-    if not os.path.exists(file_path):
+    # A SharePoint or OneDrive URL is not a path os can check; PowerPoint opens
+    # it directly and reports its own error when the URL is wrong.
+    is_url = file_path.strip().lower().startswith(("http://", "https://"))
+    if not is_url and not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
     # Opening a file legitimately needs PowerPoint, so launch it if not running.
