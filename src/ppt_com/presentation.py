@@ -15,6 +15,7 @@ from utils.offload import run_offloaded
 from utils.color import int_to_hex
 from backend import ppt
 from utils.onedrive import resolve_local_path
+from utils.com_wrapper import pywintypes
 from ppt_com.constants import (
     msoTrue,
     msoFalse,
@@ -419,7 +420,9 @@ def _open_presentation_impl(
 ) -> dict:
     # A SharePoint or OneDrive URL is not a path os can check; PowerPoint opens
     # it directly and reports its own error when the URL is wrong.
-    if not _is_url(file_path) and not os.path.exists(file_path):
+    if _is_url(file_path):
+        file_path = file_path.strip()
+    elif not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
     # Opening a file legitimately needs PowerPoint, so launch it if not running.
@@ -744,9 +747,11 @@ def open_presentation(params: OpenPresentationInput) -> str:
         )
         return json.dumps(result)
     except Exception as e:
-        if _is_url(params.file_path):
+        if _is_url(params.file_path) and isinstance(e, pywintypes.com_error):
             # PowerPoint's own error for a URL it cannot open is a bare E_FAIL
             # with no description, which says nothing about what went wrong.
+            # Anything else (a timeout, PowerPoint busy or missing) is not
+            # about the URL and is reported as it is.
             return json.dumps({"error": (
                 f"PowerPoint could not open {params.file_path}. Check that the "
                 "URL is right and that PowerPoint is signed in to an account "

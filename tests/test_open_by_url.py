@@ -136,17 +136,36 @@ def _open_tool_with_failing_open(monkeypatch, error):
     ))["error"]
 
 
+@windows_only
 def test_open_explains_a_url_powerpoint_cannot_open(monkeypatch):
-    open_tool = _open_tool_with_failing_open(monkeypatch, RuntimeError("E_FAIL"))
+    import pywintypes
+
+    e_fail = pywintypes.com_error(-2147352567, "Exception occurred.", None, None)
+    open_tool = _open_tool_with_failing_open(monkeypatch, e_fail)
 
     error = open_tool(_ENCODED)
 
     assert error.startswith(f"PowerPoint could not open {_ENCODED}.")
     assert "signed in" in error
-    assert "(E_FAIL)" in error
+    assert "-2147352567" in error
+
+
+def test_open_reports_a_non_com_error_on_a_url_unchanged(monkeypatch):
+    open_tool = _open_tool_with_failing_open(monkeypatch, TimeoutError("timed out"))
+
+    assert open_tool(_ENCODED) == "timed out"
 
 
 def test_open_reports_a_local_error_unchanged(monkeypatch):
     open_tool = _open_tool_with_failing_open(monkeypatch, RuntimeError("E_FAIL"))
 
-    assert open_tool("C:\Decks\Broken.pptx") == "E_FAIL"
+    assert open_tool(r"C:\Decks\Broken.pptx") == "E_FAIL"
+
+
+@windows_only
+def test_open_strips_whitespace_around_a_url(open_impl):
+    impl, app = open_impl
+
+    impl("  " + _ENCODED + "\n", True, False, False)
+
+    assert app.Presentations.Open.call_args.kwargs["FileName"] == _ENCODED
