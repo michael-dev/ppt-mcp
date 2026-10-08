@@ -107,7 +107,9 @@ class OpenPresentationInput(BaseModel):
         ...,
         description=(
             "Full path to the presentation file (.pptx, .pptm, .ppt, .potx, etc.), "
-            "or, on Windows, the https:// URL of a file in SharePoint or OneDrive."
+            "or, on Windows, the https:// URL of a file in SharePoint or OneDrive "
+            "(a direct URL or a sharing link). A deck opened from a sharing link "
+            "is afterwards named by the full_name this tool returns."
         ),
     )
     read_only: bool = Field(
@@ -405,6 +407,10 @@ def _create_presentation_impl(
     }
 
 
+def _is_url(file_path: str) -> bool:
+    return file_path.strip().lower().startswith(("http://", "https://"))
+
+
 def _open_presentation_impl(
     file_path: str,
     read_only: bool,
@@ -413,8 +419,7 @@ def _open_presentation_impl(
 ) -> dict:
     # A SharePoint or OneDrive URL is not a path os can check; PowerPoint opens
     # it directly and reports its own error when the URL is wrong.
-    is_url = file_path.strip().lower().startswith(("http://", "https://"))
-    if not is_url and not os.path.exists(file_path):
+    if not _is_url(file_path) and not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
     # Opening a file legitimately needs PowerPoint, so launch it if not running.
@@ -739,6 +744,14 @@ def open_presentation(params: OpenPresentationInput) -> str:
         )
         return json.dumps(result)
     except Exception as e:
+        if _is_url(params.file_path):
+            # PowerPoint's own error for a URL it cannot open is a bare E_FAIL
+            # with no description, which says nothing about what went wrong.
+            return json.dumps({"error": (
+                f"PowerPoint could not open {params.file_path}. Check that the "
+                "URL is right and that PowerPoint is signed in to an account "
+                f"that can open it. ({e})"
+            )})
         return json.dumps({"error": str(e)})
 
 

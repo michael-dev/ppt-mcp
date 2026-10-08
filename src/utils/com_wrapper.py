@@ -145,7 +145,8 @@ def pick_presentation(candidates, wanted: str):
             Never falls back to another deck: the caller named this one.
     """
     key = wanted.strip().lower()
-    by_full = [c for c in candidates if full_name_key(c[0]) == full_name_key(wanted)]
+    full_key = full_name_key(wanted)
+    by_full = [c for c in candidates if full_name_key(c[0]) == full_key]
     if len(by_full) == 1:
         return by_full[0][2]
     by_name = [

@@ -122,3 +122,31 @@ def test_open_still_refuses_a_missing_local_file(open_impl, tmp_path):
     with pytest.raises(FileNotFoundError, match="File not found"):
         impl(missing, False, True, True)
     app.Presentations.Open.assert_not_called()
+
+
+def _open_tool_with_failing_open(monkeypatch, error):
+    import json
+    from ppt_com import presentation
+
+    fake_ppt = MagicMock()
+    fake_ppt.execute.side_effect = error
+    monkeypatch.setattr(presentation, "ppt", fake_ppt)
+    return lambda path: json.loads(presentation.open_presentation(
+        presentation.OpenPresentationInput(file_path=path)
+    ))["error"]
+
+
+def test_open_explains_a_url_powerpoint_cannot_open(monkeypatch):
+    open_tool = _open_tool_with_failing_open(monkeypatch, RuntimeError("E_FAIL"))
+
+    error = open_tool(_ENCODED)
+
+    assert error.startswith(f"PowerPoint could not open {_ENCODED}.")
+    assert "signed in" in error
+    assert "(E_FAIL)" in error
+
+
+def test_open_reports_a_local_error_unchanged(monkeypatch):
+    open_tool = _open_tool_with_failing_open(monkeypatch, RuntimeError("E_FAIL"))
+
+    assert open_tool("C:\Decks\Broken.pptx") == "E_FAIL"
